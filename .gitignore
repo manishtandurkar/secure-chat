@@ -1,0 +1,124 @@
+# Compiled binaries
+bin/
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+*.ko
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Core dumps
+core
+core.*
+
+# TLS Certificates (regenerate with 'make certs')
+certs/
+*.crt
+*.key
+*.pem
+*.csr
+
+# Runtime data
+data/offline_queue/
+*.ratchet
+*.db
+*.sqlite
+*.log
+
+# Build system
+*.d
+.deps/
+.libs/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.bak
+
+# OS-specific
+Thumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# Valgrind output
+*.valgrind
+vgcore.*
+massif.out.*
+
+# Coverage files
+*.gcov
+*.gcda
+*.gcno
+
+# Documentation build artifacts
+docs/_build/
+docs/*.html
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Session state (Copilot artifacts - can optionally track these)
+.copilot/session-state/
+
+# Package manager artifacts
+node_modules/
+package-lock.json
+
+# Testing artifacts
+test_results/
+*.test
+
+# Backup files
+*~
+*.orig
+*.rej
+
+# ctags/cscope
+tags
+TAGS
+cscope.*
+
+# Dependency directories
+.deps/
+vendor/
