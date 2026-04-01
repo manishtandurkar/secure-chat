@@ -3,7 +3,10 @@
 
 #include "common.h"
 #include "tls_layer.h"
+#include "ratchet.h"
+#include "priority_queue.h"
 #include <pthread.h>
+#include <openssl/evp.h>
 
 /* Client state structure */
 typedef struct {
@@ -11,11 +14,18 @@ typedef struct {
     SSL_CTX *ssl_ctx;
     char username[MAX_USERNAME_LEN];
     char current_room[MAX_ROOM_NAME_LEN];
+    int tcp_socket;
     int udp_socket;
+    struct sockaddr_in server_addr;
     int running;
     pthread_t recv_thread;
     pthread_t send_thread;
-    unsigned char aes_key[AES_KEY_LEN];
+    pthread_t udp_thread;
+    RatchetState ratchet;
+    EVP_PKEY *rsa_keypair;
+    uint8_t dedup_set[DEDUP_WINDOW][MSG_ID_LEN];
+    int dedup_idx;
+    pthread_mutex_t ratchet_lock;
 } ClientState;
 
 /**
@@ -55,6 +65,11 @@ void *recv_thread_func(void *arg);
 void *send_thread_func(void *arg);
 
 /**
+ * Thread function for UDP presence and backup messages
+ */
+void *udp_thread_func(void *arg);
+
+/**
  * Perform DH key exchange with server
  */
 int perform_dh_exchange(ClientState *client);
@@ -63,5 +78,25 @@ int perform_dh_exchange(ClientState *client);
  * Authenticate with server using RSA signature
  */
 int authenticate_with_server(ClientState *client);
+
+/**
+ * Save ratchet state to encrypted file
+ */
+int save_ratchet_state(ClientState *client);
+
+/**
+ * Load ratchet state from encrypted file
+ */
+int load_ratchet_state(ClientState *client);
+
+/**
+ * Check if message ID is in dedup set
+ */
+int is_duplicate(ClientState *client, const uint8_t *msg_id);
+
+/**
+ * Add message ID to dedup set
+ */
+void add_to_dedup(ClientState *client, const uint8_t *msg_id);
 
 #endif /* CLIENT_H */

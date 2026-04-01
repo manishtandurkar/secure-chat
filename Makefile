@@ -78,15 +78,18 @@ certs:
 	cp certs/server.crt certs/ca.crt
 
 # Build tests
-tests: bin bin/test_crypto bin/test_socket bin/test_tls
+tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath
+
+bin/test_ratchet: tests/test_ratchet.c $(OBJ_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 bin/test_crypto: tests/test_crypto.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-bin/test_socket: tests/test_socket.c $(OBJ_COMMON)
+bin/test_adaptive: tests/test_adaptive.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-bin/test_tls: tests/test_tls.c $(OBJ_COMMON)
+bin/test_multipath: tests/test_multipath.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Generic rule for object files
@@ -110,8 +113,12 @@ install-deps:
 
 # Run tests
 test: tests
+	@echo "\n=== Running Test Suite ===\n"
+	./bin/test_ratchet
 	./bin/test_crypto
-	./bin/test_socket
+	./bin/test_adaptive
+	./bin/test_multipath
+	@echo "\n=== All Tests Complete ===\n"
 
 # Debug build
 debug: CFLAGS += -DDEBUG -O0

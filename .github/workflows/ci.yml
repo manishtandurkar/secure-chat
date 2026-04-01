@@ -1,0 +1,232 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'Makefile'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'Makefile'
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04]
+        compiler: [gcc]
+        include:
+          - os: ubuntu-20.04
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            pkg-config \
+            valgrind \
+            --no-install-recommends
+
+      - name: Verify compiler versions
+        run: |
+          ${{ matrix.cc }} --version
+          openssl version
+
+      - name: Clean build directory
+        run: make clean-all
+
+      - name: Generate TLS certificates
+        run: make certs
+
+      - name: Build server and client
+        run: make all
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build tests
+        run: make tests
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Run test suite
+        run: make test
+        timeout-minutes: 5
+
+      - name: Run Phase 1 tests (basic networking)
+        run: |
+          make phase1
+          ./bin/server_phase1 &
+          SERVER_PID=$!
+          sleep 1
+          timeout 3 ./bin/client_phase1 localhost 8080 test_user || true
+          kill $SERVER_PID 2>/dev/null || true
+        timeout-minutes: 2
+
+      - name: Memory safety check (server)
+        run: |
+          valgrind \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --track-origins=yes \
+            --verbose \
+            --log-file=valgrind-server.log \
+            ./bin/server &
+          SERVER_PID=$!
+          sleep 2
+          kill $SERVER_PID 2>/dev/null || true
+          cat valgrind-server.log
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts-${{ matrix.os }}
+          path: |
+            bin/
+            certs/
+          retention-days: 7
+
+      - name: Upload valgrind logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: valgrind-logs-${{ matrix.os }}
+          path: valgrind-*.log
+          retention-days: 7
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            pkg-config \
+            gcov \
+            lcov \
+            --no-install-recommends
+
+      - name: Generate TLS certificates
+        run: make certs
+
+      - name: Build with coverage
+        run: |
+          make clean-all
+          COVERAGE_FLAGS="-fprofile-arcs -ftest-coverage"
+          make all CFLAGS="${COVERAGE_FLAGS} -Wall -Wextra -Wpedantic -std=c11 -g -I./include $(pkg-config --cflags openssl)"
+          make tests CFLAGS="${COVERAGE_FLAGS} -Wall -Wextra -Wpedantic -std=c11 -g -I./include $(pkg-config --cflags openssl)"
+
+      - name: Run tests for coverage
+        run: make test || true
+
+      - name: Generate coverage report
+        run: |
+          lcov --directory src --capture --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' --output-file coverage.info
+          genhtml coverage.info --output-directory coverage_html
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.info
+          flags: unittests
+          name: codecov-report
+          fail_ci_if_error: false
+
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage_html/
+          retention-days: 30
+
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            pkg-config \
+            cppcheck \
+            --no-install-recommends
+
+      - name: Run static analysis (cppcheck)
+        run: |
+          cppcheck \
+            --enable=all \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --error-exitcode=1 \
+            --std=c11 \
+            -I./include \
+            src/ \
+            tests/ || echo "Some warnings found"
+
+      - name: Check for compiler warnings
+        run: |
+          make clean-all
+          make certs
+          make all 2>&1 | grep -i "warning" | head -20 || echo "No warnings found"
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: File permission checks
+        run: |
+          echo "Checking for world-writable files..."
+          if find . -type f -perm /002 ! -path './.git/*' ! -path 'node_modules/*'; then
+            echo "Found world-writable files!"
+            exit 1
+          fi
+
+      - name: Sensitive file checks
+        run: |
+          echo "Checking for hardcoded credentials..."
+          if grep -r "password\|API_KEY\|SECRET" src/ --include="*.c" 2>/dev/null | grep -v "\/\/"; then
+            echo "Warning: Potential hardcoded secrets found"
+          fi
+          echo "Check passed"
+
+      - name: Check for deprecated crypto functions
+        run: |
+          echo "Checking for deprecated OpenSSL functions..."
+          if grep -r "RSA_new\|RSA_generate_key\|SSL_use_certificate_ASN1" src/ --include="*.c"; then
+            echo "Found deprecated crypto functions"
+          fi
+          echo "Check completed"

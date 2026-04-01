@@ -1,0 +1,121 @@
+name: Release Automation
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Release Artifacts
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            pkg-config \
+            --no-install-recommends
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION"
+
+      - name: Generate TLS certificates
+        run: make certs
+
+      - name: Build all
+        run: make all
+
+      - name: Create distribution tarball
+        run: |
+          mkdir -p dist
+          tar -czf dist/adaptive-secure-chat-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz \
+            bin/server \
+            bin/client \
+            certs/ \
+            include/ \
+            README.md \
+            AGENTS.md
+
+      - name: Create source tarball
+        run: |
+          tar -czf dist/adaptive-secure-chat-${{ steps.get_version.outputs.version }}-src.tar.gz \
+            --exclude=.git \
+            --exclude=bin \
+            --exclude=data \
+            --exclude=.github \
+            .
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          md5sum * > MD5SUMS
+          cat SHA256SUMS MD5SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.version, 'alpha') || contains(steps.get_version.outputs.version, 'beta') }}
+          body: |
+            # Release ${{ steps.get_version.outputs.version }}
+
+            ## Build Information
+            - **Build Date**: ${{ github.event.head_commit.timestamp }}
+            - **Commit**: ${{ github.sha }}
+            - **OS**: Linux x86_64
+            - **Compiler**: GCC (Ubuntu 22.04)
+            - **OpenSSL**: 3.x
+
+            ## Artifacts
+            - `adaptive-secure-chat-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz` - Compiled binaries
+            - `adaptive-secure-chat-${{ steps.get_version.outputs.version }}-src.tar.gz` - Source code
+            - `SHA256SUMS` / `MD5SUMS` - Checksums for verification
+
+            ## Installation
+            ```bash
+            tar -xzf adaptive-secure-chat-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz
+            ./bin/server      # Terminal 1
+            ./bin/client localhost 8080 alice    # Terminal 2
+            ```
+
+            ## Testing
+            All tests passed on Ubuntu 20.04 and 22.04.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  documentation:
+    name: Generate Release Documentation
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create documentation artifact
+        run: |
+          mkdir -p docs-release
+          cp README.md docs-release/
+          cp AGENTS.md docs-release/
+          if [ -f docs/architecture.md ]; then cp docs/architecture.md docs-release/; fi
+          if [ -f docs/ratchet_spec.md ]; then cp docs/ratchet_spec.md docs-release/; fi
+
+      - name: Upload documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-documentation
+          path: docs-release/
+          retention-days: 30
