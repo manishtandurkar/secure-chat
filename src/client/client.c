@@ -3,6 +3,8 @@
  * Implements AGENTS.md specification for client-side operations
  */
 
+#define _POSIX_C_SOURCE 200809L
+#include "platform_compat.h"
 #include "client.h"
 #include "crypto.h"
 #include "message.h"
@@ -12,12 +14,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+
+#ifndef PLATFORM_WINDOWS
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 /* Global client state for signal handlers */
 static ClientState *g_client = NULL;
@@ -140,7 +144,8 @@ int perform_dh_exchange(ClientState *client) {
 
     /* Serialize our public key */
     uint8_t our_pubkey[DH_PUBKEY_LEN];
-    if (dh_serialize_pubkey(dh_keypair, our_pubkey, sizeof(our_pubkey)) != 0) {
+    size_t pubkey_len = DH_PUBKEY_LEN;
+    if (dh_serialize_pubkey(dh_keypair, our_pubkey, DH_PUBKEY_LEN, &pubkey_len) != 0) {
         fprintf(stderr, "Failed to serialize DH public key\n");
         EVP_PKEY_free(dh_keypair);
         return -1;
@@ -193,6 +198,7 @@ int perform_dh_exchange(ClientState *client) {
 
     /* Derive shared secret */
     uint8_t shared_secret[32];
+    size_t shared_secret_len = sizeof(shared_secret);
     EVP_PKEY *peer_key = dh_deserialize_pubkey(peer_pubkey, DH_PUBKEY_LEN);
     if (!peer_key) {
         fprintf(stderr, "Failed to deserialize peer DH key\n");
@@ -200,7 +206,7 @@ int perform_dh_exchange(ClientState *client) {
         return -1;
     }
 
-    if (dh_compute_shared_secret(dh_keypair, peer_key, shared_secret, sizeof(shared_secret)) != 0) {
+    if (dh_compute_shared_secret(dh_keypair, peer_key, shared_secret, &shared_secret_len) != 0) {
         fprintf(stderr, "Failed to compute shared secret\n");
         EVP_PKEY_free(peer_key);
         EVP_PKEY_free(dh_keypair);
@@ -588,6 +594,30 @@ void client_cleanup(ClientState *client) {
     pthread_mutex_destroy(&client->ratchet_lock);
 }
 
+/* Save ratchet state to encrypted file */
+int save_ratchet_state(ClientState *client) {
+    /* TODO: Implement ratchet state persistence
+     * 1. Serialize ratchet state using ratchet_serialize()
+     * 2. Encrypt serialized state with passphrase-derived key
+     * 3. Write to ~/.aschat/<username>.ratchet with 0600 permissions
+     */
+    (void)client;
+    fprintf(stderr, "[WARN] save_ratchet_state not yet implemented\n");
+    return 0; /* Non-fatal for now */
+}
+
+/* Load ratchet state from encrypted file */
+int load_ratchet_state(ClientState *client) {
+    /* TODO: Implement ratchet state recovery
+     * 1. Read from ~/.aschat/<username>.ratchet
+     * 2. Decrypt using passphrase-derived key
+     * 3. Deserialize using ratchet_deserialize()
+     * Returns 0 on success, -1 if file doesn't exist (first run)
+     */
+    (void)client;
+    return -1; /* Indicates no saved state exists */
+}
+
 /* Main client entry point */
 int main(int argc, char *argv[]) {
     if (argc != 4) {
@@ -606,10 +636,11 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_shutdown);
     signal(SIGTERM, handle_shutdown);
 
-    /* Initialize OpenSSL */
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
+    /* Initialize OpenSSL (using newer API for OpenSSL 1.1.0+) */
+    if (!OPENSSL_init_ssl(0, NULL)) {
+        fprintf(stderr, "Failed to initialize OpenSSL\n");
+        return 1;
+    }
 
     /* Initialize client and connect */
     if (client_init(&client, hostname, port, username) != 0) {

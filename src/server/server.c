@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+#include "platform_compat.h"
 #include "server.h"
 #include "tls_layer.h"
 #include "adaptive_engine.h"
@@ -5,13 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <errno.h>
+
+#ifdef PLATFORM_WINDOWS
+#error "Server with fork() is not supported on Windows. Use a thread-based architecture or run on Linux."
+#endif
 
 /* Signal handler for SIGCHLD to reap zombie processes */
 void sigchld_handler(int sig) {
@@ -73,9 +73,13 @@ int main(int argc, char *argv[]) {
     }
 
     /* Set SO_REUSEADDR option */
+#ifdef PLATFORM_WINDOWS
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
+#else
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+#endif
         perror("setsockopt");
-        close(server_fd);
+        socket_close(server_fd);
         tls_free_ctx(tls_ctx);
         return 1;
     }
@@ -89,7 +93,7 @@ int main(int argc, char *argv[]) {
     /* Bind socket */
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
-        close(server_fd);
+        socket_close(server_fd);
         tls_free_ctx(tls_ctx);
         return 1;
     }
@@ -97,7 +101,7 @@ int main(int argc, char *argv[]) {
     /* Start listening */
     if (listen(server_fd, MAX_CLIENTS) < 0) {
         perror("listen");
-        close(server_fd);
+        socket_close(server_fd);
         tls_free_ctx(tls_ctx);
         return 1;
     }
@@ -117,7 +121,8 @@ int main(int argc, char *argv[]) {
         client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
         
         if (client_fd < 0) {
-            if (errno == EINTR) {
+            int err = socket_errno;
+            if (socket_interrupted(err)) {
                 continue; /* Interrupted by signal, try again */
             }
             perror("accept");
@@ -133,21 +138,50 @@ int main(int argc, char *argv[]) {
         
         if (child_pid < 0) {
             perror("fork");
-            close(client_fd);
+            socket_close(client_fd);
             continue;
         } else if (child_pid == 0) {
             /* Child process */
-            close(server_fd);  /* Child doesn't need the listening socket */
+            socket_close(server_fd);  /* Child doesn't need the listening socket */
             handle_client(client_fd, tls_ctx, &engine, &metrics);
             /* This point should not be reached (child calls exit) */
             exit(0);
         } else {
             /* Parent process */
-            close(client_fd);  /* Parent doesn't need the client socket */
+            socket_close(client_fd);  /* Parent doesn't need the client socket */
         }
     }
 
-    close(server_fd);
+    socket_close(server_fd);
     tls_free_ctx(tls_ctx);
     return 0;
+}
+
+/* Server initialization function */
+int server_init(void) {
+    /* TODO: Implement server resource initialization
+     * 1. Create shared memory segment for EngineState
+     * 2. Initialize routing table (username → pid mapping)
+     * 3. Create offline_queue directory if not exists
+     * 4. Initialize UDP notification socket
+     * Returns 0 on success, -1 on error
+     */
+    fprintf(stderr, "[WARN] server_init not yet implemented (using inline init)\n");
+    return 0;
+}
+
+/* Server cleanup function */
+void server_cleanup(void) {
+    /* TODO: Implement server resource cleanup
+     * 1. Free shared memory segment
+     * 2. Clean up routing table
+     * 3. Close UDP notification socket
+     * 4. Expire all IDS blocks
+     */
+    fprintf(stderr, "[WARN] server_cleanup not yet implemented\n");
+}
+
+/* Main server entry point (wrapper for main) */
+int server_main(int argc, char *argv[]) {
+    return main(argc, argv);
 }

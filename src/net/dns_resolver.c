@@ -1,10 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
 #include "dns_resolver.h"
+#include "platform_compat.h"
 #include <stdio.h>
 #include <string.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netdb.h>
-#include <arpa/inet.h>
 
 int dns_resolve(const char *hostname, char *ip_out, size_t ip_out_len) {
     if (!hostname || !ip_out || ip_out_len < INET_ADDRSTRLEN) {

@@ -1,10 +1,36 @@
 # Makefile for Secure Multi-Client Chat Application
 
+# Detect OS
+ifeq ($(OS),Windows_NT)
+    DETECTED_OS := Windows
+    SHELL := cmd.exe
+    RM := del /Q /F
+    RMDIR := rmdir /S /Q
+    MKDIR := mkdir
+    PATHSEP := \\
+    EXE_EXT := .exe
+    # Windows-specific flags
+    LDFLAGS_PLATFORM := -lws2_32
+    CFLAGS_PLATFORM := 
+else
+    DETECTED_OS := $(shell uname -s)
+    RM := rm -f
+    RMDIR := rm -rf
+    MKDIR := mkdir -p
+    PATHSEP := /
+    EXE_EXT :=
+    # Unix-specific flags
+    LDFLAGS_PLATFORM :=
+    CFLAGS_PLATFORM :=
+endif
+
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -g \
           -I./include \
-          $(shell pkg-config --cflags openssl)
-LDFLAGS = $(shell pkg-config --libs openssl) -lpthread
+          $(CFLAGS_PLATFORM) \
+          $(shell pkg-config --cflags openssl 2>nul || echo -I/usr/include)
+LDFLAGS = $(shell pkg-config --libs openssl 2>nul || echo -lssl -lcrypto) \
+          -lpthread $(LDFLAGS_PLATFORM)
 
 # Source file groups
 SRC_COMMON = src/crypto/rsa_utils.c src/crypto/aes_utils.c \

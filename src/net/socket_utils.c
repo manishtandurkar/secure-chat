@@ -1,11 +1,5 @@
 #include "socket_utils.h"
 #include "message.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -24,9 +18,14 @@ int create_server_socket(int port) {
     }
 
     /* Set SO_REUSEADDR option */
+#ifdef PLATFORM_WINDOWS
+    /* On Windows, setsockopt expects char* for option value */
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
+#else
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+#endif
         perror("setsockopt SO_REUSEADDR");
-        close(sockfd);
+        socket_close(sockfd);
         return -1;
     }
 
@@ -39,14 +38,14 @@ int create_server_socket(int port) {
     /* Bind socket to address */
     if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
-        close(sockfd);
+        socket_close(sockfd);
         return -1;
     }
 
     /* Start listening for connections */
     if (listen(sockfd, MAX_CLIENTS) < 0) {
         perror("listen");
-        close(sockfd);
+        socket_close(sockfd);
         return -1;
     }
 
@@ -81,7 +80,7 @@ int connect_to_server(int sockfd, const char *hostname, int port) {
     /* Initialize server address structure */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
     server_addr.sin_port = htons(port);
 
     /* Connect to server */
@@ -102,7 +101,8 @@ int send_all(int sockfd, const void *buf, size_t len) {
     while (total_sent < len) {
         ssize_t sent = send(sockfd, data + total_sent, len - total_sent, 0);
         if (sent < 0) {
-            if (errno == EINTR || errno == EAGAIN) {
+            int err = socket_errno;
+            if (socket_interrupted(err) || socket_would_block(err)) {
                 continue;
             }
             perror("send");
@@ -127,7 +127,8 @@ int recv_all(int sockfd, void *buf, size_t len) {
     while (total_received < len) {
         ssize_t received = recv(sockfd, data + total_received, len - total_received, 0);
         if (received < 0) {
-            if (errno == EINTR || errno == EAGAIN) {
+            int err = socket_errno;
+            if (socket_interrupted(err) || socket_would_block(err)) {
                 continue;
             }
             perror("recv");
@@ -233,23 +234,17 @@ int recv_message(int sockfd, MsgHeader *header_out, void **payload_out) {
 }
 
 int set_nonblocking(int sockfd) {
-    int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags < 0) {
-        perror("fcntl F_GETFL");
-        return -1;
-    }
-
-    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        perror("fcntl F_SETFL");
-        return -1;
-    }
-
-    return 0;
+    return platform_set_nonblocking(sockfd);
 }
 
 int set_reuseaddr(int sockfd) {
     int opt = 1;
+#ifdef PLATFORM_WINDOWS
+    /* On Windows, setsockopt expects char* for option value */
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
+#else
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+#endif
         perror("setsockopt SO_REUSEADDR");
         return -1;
     }

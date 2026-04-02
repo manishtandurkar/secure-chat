@@ -2,11 +2,17 @@
  * Adaptive Engine Tests - Validate mode transitions
  */
 
+#include "platform_compat.h"
 #include "../include/adaptive_engine.h"
 #include "../include/common.h"
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
+
+#ifdef PLATFORM_WINDOWS
+#include <windows.h>
+#define sleep(x) Sleep((x) * 1000)
+#define usleep(x) Sleep((x) / 1000)
+#endif
 
 #define TEST_PASS "\033[32m[PASS]\033[0m"
 #define TEST_FAIL "\033[31m[FAIL]\033[0m"

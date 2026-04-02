@@ -19,6 +19,7 @@
 #define RSA_KEY_BITS          2048
 #define RATCHET_KEY_LEN       32
 #define MSG_ID_LEN            16      /* Random 128-bit message ID */
+#define DH_PUBKEY_LEN         32      /* X25519 public key size */
 
 /* Deduplication and queue constants */
 #define DEDUP_WINDOW          1024    /* Recent message IDs to remember */
@@ -41,6 +42,7 @@
 
 /* Protocol version */
 #define PROTOCOL_VERSION      0x02  /* Updated for new features */
+#define MSG_VERSION           PROTOCOL_VERSION  /* Message header version */
 
 /* Error codes */
 #define SUCCESS           0

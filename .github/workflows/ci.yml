@@ -97,7 +97,7 @@ jobs:
 
       - name: Upload build artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-${{ matrix.os }}
           path: |
@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload valgrind logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: valgrind-logs-${{ matrix.os }}
           path: valgrind-*.log
@@ -159,7 +159,7 @@ jobs:
           fail_ci_if_error: false
 
       - name: Upload coverage HTML
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage_html/

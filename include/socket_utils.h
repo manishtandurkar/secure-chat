@@ -1,9 +1,8 @@
 #ifndef SOCKET_UTILS_H
 #define SOCKET_UTILS_H
 
+#include "platform_compat.h"
 #include "message.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
 
 /**
  * Create a TCP socket for server use

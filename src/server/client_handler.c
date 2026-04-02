@@ -1,3 +1,4 @@
+#include "platform_compat.h"
 #include "server.h"
 #include "crypto.h"
 #include "ratchet.h"
@@ -10,8 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 
 /* Handle individual client connection (runs in child process) */
 void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *metrics) {
@@ -30,7 +29,7 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
     /* Check if IP is blocked */
     if (ids_is_blocked(client_ip)) {
         fprintf(stderr, "[Server] Blocked IP attempted connection: %s\n", client_ip);
-        close(connfd);
+        socket_close(connfd);
         return;
     }
     
@@ -38,7 +37,7 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
     ssl = tls_wrap_server_socket(tls_ctx, connfd);
     if (!ssl) {
         fprintf(stderr, "[Server] TLS handshake failed\n");
-        close(connfd);
+        socket_close(connfd);
         return;
     }
     

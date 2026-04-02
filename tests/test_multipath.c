@@ -232,8 +232,10 @@ int main(void) {
     printf("╚══════════════════════════════════════════════╝\n");
     
     /* Initialize OpenSSL for RAND_bytes */
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
+    if (!OPENSSL_init_ssl(0, NULL)) {
+        fprintf(stderr, "Failed to initialize OpenSSL\n");
+        return 1;
+    }
     
     /* Run tests */
     if (test_deduplication()) tests_passed++; else tests_failed++;

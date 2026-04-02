@@ -1,6 +1,7 @@
 #ifndef CLIENT_H
 #define CLIENT_H
 
+#include "platform_compat.h"
 #include "common.h"
 #include "tls_layer.h"
 #include "ratchet.h"

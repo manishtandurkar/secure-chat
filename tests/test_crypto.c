@@ -198,15 +198,17 @@ int test_dh_exchange(void) {
     /* Compute shared secrets */
     uint8_t alice_shared[32];
     uint8_t bob_shared[32];
+    size_t alice_shared_len = sizeof(alice_shared);
+    size_t bob_shared_len = sizeof(bob_shared);
     
-    if (dh_compute_shared_secret(alice_key, bob_key, alice_shared, sizeof(alice_shared)) != 0) {
+    if (dh_compute_shared_secret(alice_key, bob_key, alice_shared, &alice_shared_len) != 0) {
         printf("%s Alice shared secret computation failed\n", TEST_FAIL);
         EVP_PKEY_free(alice_key);
         EVP_PKEY_free(bob_key);
         return 0;
     }
     
-    if (dh_compute_shared_secret(bob_key, alice_key, bob_shared, sizeof(bob_shared)) != 0) {
+    if (dh_compute_shared_secret(bob_key, alice_key, bob_shared, &bob_shared_len) != 0) {
         printf("%s Bob shared secret computation failed\n", TEST_FAIL);
         EVP_PKEY_free(alice_key);
         EVP_PKEY_free(bob_key);
@@ -235,8 +237,10 @@ int main(void) {
     printf("╚══════════════════════════════════════════════╝\n");
     
     /* Initialize OpenSSL */
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
+    if (!OPENSSL_init_ssl(0, NULL)) {
+        fprintf(stderr, "Failed to initialize OpenSSL\n");
+        return 1;
+    }
     
     /* Run tests */
     if (test_rsa_sign_verify()) tests_passed++; else tests_failed++;

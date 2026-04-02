@@ -1,9 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
+#include "platform_compat.h"
 #include "multipath.h"
 #include "message.h"
+#include "tls_layer.h"
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/socket.h>
 #include <pthread.h>
 #include <openssl/rand.h>
 

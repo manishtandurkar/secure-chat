@@ -290,8 +290,10 @@ int main(void) {
     printf("╚══════════════════════════════════════════════╝\n");
     
     /* Initialize OpenSSL */
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
+    if (!OPENSSL_init_ssl(0, NULL)) {
+        fprintf(stderr, "Failed to initialize OpenSSL\n");
+        return 1;
+    }
     
     /* Run tests */
     tests_passed += test_key_uniqueness();

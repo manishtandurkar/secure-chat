@@ -208,3 +208,16 @@ void tls_free_ctx(SSL_CTX *ctx) {
         SSL_CTX_free(ctx);
     }
 }
+
+/* Initialize OpenSSL library (call once at startup) */
+int tls_init(void) {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    return SUCCESS;
+}
+
+/* Cleanup OpenSSL library (call once at shutdown) */
+void tls_cleanup(void) {
+    EVP_cleanup();
+    ERR_free_strings();
+}

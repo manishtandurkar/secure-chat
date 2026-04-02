@@ -1,12 +1,24 @@
+#define _POSIX_C_SOURCE 200809L
+#include "platform_compat.h"
 #include "offline_queue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef PLATFORM_WINDOWS
+#include <direct.h>
+#include <io.h>
+#define mkdir(path, mode) _mkdir(path)
+#define stat _stat
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+typedef struct _finddata_t DIR_ENTRY;
+#else
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
-#include <time.h>
+#endif
 
 #define QUEUE_DIR "data/offline_queue"
 
