@@ -24,13 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-20.04, ubuntu-22.04]
-        compiler: [gcc]
-        include:
-          - os: ubuntu-20.04
-            compiler: gcc
-            cc: gcc
-            cxx: g++
+        os: [ubuntu-22.04, ubuntu-24.04]
 
     steps:
       - name: Checkout code
@@ -48,7 +42,7 @@ jobs:
 
       - name: Verify compiler versions
         run: |
-          ${{ matrix.cc }} --version
+          gcc --version
           openssl version
 
       - name: Clean build directory
@@ -59,13 +53,9 @@ jobs:
 
       - name: Build server and client
         run: make all
-        env:
-          CC: ${{ matrix.cc }}
 
       - name: Build tests
         run: make tests
-        env:
-          CC: ${{ matrix.cc }}
 
       - name: Run test suite
         run: make test
@@ -127,7 +117,6 @@ jobs:
             build-essential \
             libssl-dev \
             pkg-config \
-            gcov \
             lcov \
             --no-install-recommends
 
@@ -210,7 +199,9 @@ jobs:
       - name: File permission checks
         run: |
           echo "Checking for world-writable files..."
-          if find . -type f -perm /002 ! -path './.git/*' ! -path 'node_modules/*'; then
+          MATCHES=$(find . -type f -perm /002 ! -path './.git/*' ! -path './node_modules/*')
+          if [ -n "$MATCHES" ]; then
+            echo "$MATCHES"
             echo "Found world-writable files!"
             exit 1
           fi
