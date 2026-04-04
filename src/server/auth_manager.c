@@ -3,6 +3,7 @@
 #include "message.h"
 #include <string.h>
 #include <stdio.h>
+#include <openssl/evp.h>
 
 /* Global RSA public keys storage (simplified) */
 static struct {

@@ -12,6 +12,11 @@ typedef struct {
 } QueuedMessage;
 
 /**
+ * Initialize priority queue. Returns 0 on success, -1 on error.
+ */
+int pq_init(void);
+
+/**
  * Thread-safe enqueue. CRITICAL messages bypass internal ordering
  * and go to the front. Returns 0 or -1 if queue full.
  */
@@ -27,5 +32,10 @@ QueuedMessage *pq_dequeue(void);
  * Current queue depth.
  */
 int pq_size(void);
+
+/**
+ * Destroy/cleanup priority queue.
+ */
+void pq_destroy(void);
 
 #endif /* PRIORITY_QUEUE_H */

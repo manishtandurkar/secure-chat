@@ -10,6 +10,7 @@
 #include <string.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 
 #define TEST_PASS "\033[32m[PASS]\033[0m"
 #define TEST_FAIL "\033[31m[FAIL]\033[0m"

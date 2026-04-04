@@ -4,9 +4,12 @@
 
 #include "../include/multipath.h"
 #include "../include/common.h"
+#include "../include/priority_queue.h"
+#include "../include/crypto.h"
 #include <stdio.h>
 #include <string.h>
 #include <openssl/rand.h>
+#include <openssl/ssl.h>
 
 #define TEST_PASS "\033[32m[PASS]\033[0m"
 #define TEST_FAIL "\033[31m[FAIL]\033[0m"

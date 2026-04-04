@@ -12,12 +12,28 @@ static int queue_rear = 0;
 static int queue_count = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static int queue_initialized = 0;
 
 /* Get current time in milliseconds */
 static uint64_t get_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Initialize priority queue */
+int pq_init(void) {
+    if (queue_initialized) {
+        return SUCCESS;
+    }
+    
+    memset(queue, 0, sizeof(queue));
+    queue_front = 0;
+    queue_rear = 0;
+    queue_count = 0;
+    queue_initialized = 1;
+    
+    return SUCCESS;
 }
 
 /* Enqueue message with priority */
@@ -80,4 +96,15 @@ int pq_size(void) {
     pthread_mutex_unlock(&queue_mutex);
     
     return size;
+}
+
+/* Cleanup priority queue */
+void pq_destroy(void) {
+    pthread_mutex_lock(&queue_mutex);
+    queue_initialized = 0;
+    queue_front = 0;
+    queue_rear = 0;
+    queue_count = 0;
+    memset(queue, 0, sizeof(queue));
+    pthread_mutex_unlock(&queue_mutex);
 }
