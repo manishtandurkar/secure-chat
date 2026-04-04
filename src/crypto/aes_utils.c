@@ -101,52 +101,55 @@ cleanup:
     return ret;
 }
 
-/* Pad plaintext to MSG_PADDED_SIZE using PKCS#7-style padding */
+/* Pad plaintext to MSG_PADDED_SIZE using length-prefix scheme
+ * Format: [4-byte little-endian length][plaintext][random padding]
+ * This allows messages up to MSG_PADDED_SIZE - 4 bytes */
 int msg_pad(const uint8_t *plaintext, size_t plaintext_len,
             uint8_t *padded_out) {
-    if (!plaintext || !padded_out || plaintext_len > MSG_PADDED_SIZE) {
+    if (!plaintext || !padded_out || plaintext_len > MSG_PADDED_SIZE - 4) {
         return ERROR_CRYPTO;
     }
     
-    /* Copy plaintext */
-    memcpy(padded_out, plaintext, plaintext_len);
+    /* Write 4-byte length prefix (little-endian) */
+    uint32_t len32 = (uint32_t)plaintext_len;
+    padded_out[0] = (uint8_t)(len32 & 0xFF);
+    padded_out[1] = (uint8_t)((len32 >> 8) & 0xFF);
+    padded_out[2] = (uint8_t)((len32 >> 16) & 0xFF);
+    padded_out[3] = (uint8_t)((len32 >> 24) & 0xFF);
     
-    /* Calculate padding length */
-    size_t padding_len = MSG_PADDED_SIZE - plaintext_len;
+    /* Copy plaintext after length prefix */
+    memcpy(padded_out + 4, plaintext, plaintext_len);
     
-    /* Apply PKCS#7 padding: fill with padding length value */
-    memset(padded_out + plaintext_len, (uint8_t)padding_len, padding_len);
+    /* Fill remaining space with random bytes for traffic analysis resistance */
+    size_t padding_start = 4 + plaintext_len;
+    size_t padding_len = MSG_PADDED_SIZE - padding_start;
+    if (padding_len > 0) {
+        RAND_bytes(padded_out + padding_start, padding_len);
+    }
     
     return SUCCESS;
 }
 
-/* Strip PKCS#7 padding after decryption */
+/* Strip padding using length-prefix scheme */
 int msg_unpad(const uint8_t *padded, size_t padded_len,
               uint8_t *plaintext_out) {
-    if (!padded || !plaintext_out || padded_len != MSG_PADDED_SIZE) {
+    if (!padded || !plaintext_out || padded_len < 4) {
         return ERROR_CRYPTO;
     }
     
-    /* Get padding length from last byte */
-    uint8_t padding_len = padded[padded_len - 1];
+    /* Read 4-byte length prefix (little-endian) */
+    uint32_t len32 = (uint32_t)padded[0] |
+                     ((uint32_t)padded[1] << 8) |
+                     ((uint32_t)padded[2] << 16) |
+                     ((uint32_t)padded[3] << 24);
     
-    /* Validate padding length */
-    if (padding_len == 0 || padding_len > MSG_PADDED_SIZE) {
+    /* Validate length */
+    if (len32 > padded_len - 4) {
         return ERROR_CRYPTO;
     }
     
-    /* Verify all padding bytes are correct */
-    for (size_t i = padded_len - padding_len; i < padded_len; i++) {
-        if (padded[i] != padding_len) {
-            return ERROR_CRYPTO;
-        }
-    }
+    /* Copy plaintext (after length prefix) */
+    memcpy(plaintext_out, padded + 4, len32);
     
-    /* Calculate original plaintext length */
-    size_t plaintext_len = padded_len - padding_len;
-    
-    /* Copy unpadded plaintext */
-    memcpy(plaintext_out, padded, plaintext_len);
-    
-    return (int)plaintext_len;
+    return (int)len32;
 }

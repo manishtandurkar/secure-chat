@@ -1,289 +1,319 @@
-# Adaptive Secure Communication System for Unreliable and Adversarial Networks
+# Adaptive Secure Communication System
 
-> **Language:** C (C11 standard)  
-> **OS Target:** Linux (Ubuntu 20.04+)  
-> **Crypto Library:** OpenSSL 3.x  
-> **Build System:** GCC + Makefile  
-> **Transport:** TCP (primary) + UDP (multi-path backup)
+Language: C11
 
-A secure, concurrent, multi-client communication application implementing:
-- **Double Ratchet Algorithm** - Per-message key derivation for forward secrecy
-- **Adaptive Engine** - Dynamic security/transport adjustments based on network conditions
-- **Multi-Path Delivery** - Simultaneous TCP+UDP transmission with deduplication
-- **Offline Message Queue** - Persistent encrypted message storage
-- **Priority Messaging** - CRITICAL/URGENT/NORMAL message prioritization
-- **Intrusion Detection** - Per-IP counters and automatic blocking
+Crypto: OpenSSL 3.x
 
-## Current Status: ✅ **IMPLEMENTATION COMPLETE**
+Build: GCC + Makefile
 
-All 7 phases fully implemented and ready for testing:
+Primary target: Linux (Ubuntu 20.04+). Windows users should run through WSL for best compatibility.
 
-### ✅ Phase 1: TCP Server + DNS + Wire Protocol (Complete)
-- [x] Fork-based concurrent TCP server
-- [x] Basic TCP client with threading  
-- [x] SIGCHLD handler for zombie process cleanup
-- [x] DNS hostname resolution (`dns_resolver.c`)
-- [x] Updated message wire protocol with 28-byte header
-- [x] Build system setup
+## What This Project Provides
 
-### ✅ Phase 2-3: Cryptography Foundation (Complete)
-- [x] RSA-2048 keypair generation, sign, verify (`rsa_utils.c`)
-- [x] X25519 Diffie-Hellman key exchange (`dh_exchange.c`)
-- [x] AES-256-CBC encryption with fresh IVs (`aes_utils.c`)
-- [x] HKDF-SHA256 and HMAC-SHA256 (`crypto_common.c`)
-- [x] PKCS#7 message padding to fixed size
+- TLS 1.3 transport setup
+- RSA authentication helpers
+- Diffie-Hellman key exchange helpers
+- Double Ratchet primitives
+- AES encryption and fixed-size message padding
+- Adaptive engine mode logic
+- Multi-path transport utilities (TCP/UDP support code)
+- Offline queue and priority queue modules
+- Unit tests for core modules
 
-### ✅ Phase 3: Double Ratchet Algorithm (Complete)
-- [x] Ratchet state initialization from DH shared secret (`ratchet.c`)
-- [x] Symmetric ratchet: `ratchet_send_step()`, `ratchet_recv_step()`
-- [x] DH ratchet: `ratchet_dh_step()` for periodic key rotation
-- [x] KDF_CK and KDF_RK key derivation functions
-- [x] State serialization for persistence
+## Repository Layout
 
-### ✅ Phase 4: TLS Layer (Complete)
-- [x] TLS 1.3 server context creation (`tls_server.c`)
-- [x] TLS 1.3 client context creation
-- [x] Socket wrapping with TLS
-- [x] Certificate loading and verification
+- `bin/` compiled binaries
+- `certs/` generated TLS cert/key files
+- `include/` headers
+- `src/` implementation
+- `tests/` unit tests
+- `data/offline_queue/` persisted offline ciphertext files
 
-### ✅ Phase 5: Server Components (Complete)
-- [x] Main server with TLS integration (`server.c`)
-- [x] Client handler with full protocol flow (`client_handler.c`)
-  - DH exchange phase
-  - RSA authentication phase
-  - Ratchet initialization
-  - Message routing loop
-- [x] Authentication manager (`auth_manager.c`)
-- [x] Room manager for group chat (`room_manager.c`)
+## Prerequisites
 
-### ✅ Phase 6: Advanced Features (Complete)
-- [x] Adaptive Engine state machine (`adaptive_engine.c`)
-  - MODE_NORMAL / MODE_UNSTABLE / MODE_HIGH_RISK
-  - Automatic transitions based on metrics
-- [x] Metrics collector (`metrics_collector.c`)
-  - Packet loss tracking
-  - RTT measurement
-  - Auth failure and replay counters
-- [x] Multi-path transport (`multipath.c`)
-  - Dual TCP+UDP send with retries
-  - Message deduplication by msg_id
-- [x] Offline message queue (`offline_queue.c`)
-  - Encrypted message persistence
-  - Automatic delivery on reconnect
-- [x] Priority message queue (`priority_queue.c`)
-  - Thread-safe CRITICAL/URGENT/NORMAL ordering
-- [x] Intrusion detection (`intrusion.c`)
-  - Per-IP auth failure tracking
-  - Automatic blocking after threshold
-  - Timed block expiration
+### Linux or WSL Ubuntu
 
-### ✅ Phase 7: Testing (Complete)
-- [x] `test_ratchet.c` - Key uniqueness, forward secrecy, DH ratchet, persistence
-- [x] `test_crypto.c` - RSA sign/verify, AES encrypt/decrypt, padding, HKDF, DH exchange
-- [x] `test_adaptive.c` - Mode initialization, transitions, auth/replay triggers, configs
-- [x] `test_multipath.c` - Deduplication, window overflow, priority ordering, payload sizes
-- [ ] Valgrind memory leak check (requires Linux build)
-- [ ] Integration test (full client-server handshake)
-
-### ✅ Client Implementation (Complete - v2.0)
-- [x] Full protocol client with TLS + Ratchet (`client.c`)
-- [x] Three-thread architecture (recv/send/udp)
-- [x] DH exchange initiator
-- [x] RSA authentication
-- [x] Ratchet state management with per-message encryption
-- [x] Message deduplication
-- [x] Input handler with commands (`input_handler.c`)
-- [x] Display module with formatting (`display.c`)
-
-## Building (Linux/Ubuntu via WSL or native)
-
-### Prerequisites
 ```bash
 sudo apt-get update
 sudo apt-get install -y gcc make libssl-dev pkg-config
 ```
 
-### Build Steps
+### Windows (PowerShell)
+
+This project is Linux-first. On Windows, use one of the two paths below.
+
+#### Recommended: WSL from PowerShell
+
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "sudo apt-get update && sudo apt-get install -y gcc make libssl-dev pkg-config"
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make clean && make all && make test"
+```
+
+Run server/client from PowerShell via WSL:
+
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/server"
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 alice"
+```
+
+#### Native Windows (advanced/optional)
+
+Native builds may require extra setup (OpenSSL dev libs, compatible toolchain, and path adjustments). If you use native Windows tools, verify:
+
+```powershell
+gcc --version
+make --version
+pkg-config --modversion openssl
+```
+
+If any of these fail or OpenSSL linkage errors appear, use the WSL path above.
+
+### Verify Toolchain
 
 ```bash
-# 1. Clone or navigate to project directory
-cd adaptive-secure-chat
+gcc --version
+make --version
+pkg-config --modversion openssl
+```
 
-# 2. Generate TLS certificates
-make certs
+PowerShell tip for WSL toolchain check:
 
-# 3. Build server and client
-make all
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "gcc --version && make --version && pkg-config --modversion openssl"
+```
 
-# 4. Build tests (optional)
-make tests
+## Build Instructions
 
-# 2. Build the full application
+From project root:
+
+```bash
+make clean
 make all
 ```
 
-This creates:
-- `bin/server` - Adaptive secure server with all features
-- `bin/client` - Multi-threaded client (implementation pending)
+From PowerShell (using WSL):
 
-### Running the Server
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make clean && make all"
+```
 
-**Terminal 1 - Start server:**
+What `make all` does:
+
+1. Creates `bin/` (if missing)
+2. Builds `bin/server`
+3. Builds `bin/client`
+4. Generates TLS materials in `certs/`
+
+Build tests:
+
+```bash
+make tests
+```
+
+Build only one target:
+
+```bash
+make server
+make client
+```
+
+Build phase-1 TCP-only binaries:
+
+```bash
+make phase1
+```
+
+## Running The Application
+
+Open three terminals.
+
+Terminal 1 (server):
+
 ```bash
 ./bin/server
 ```
 
-Expected output:
-```
-Starting Adaptive Secure Communication System
-Protocol Version: 0x02
-Features: Double Ratchet | Multi-Path | Adaptive Engine | Offline Queue
+Terminal 2 (client A):
 
-[Engine] Initialized in MODE_NORMAL
-[TLS] Server context created (TLS 1.3)
-[Server] Listening on port 8080
-[Server] Waiting for connections...
-```
-
-### Testing (Manual)
-```
-┌─────────────────────────┐         ┌─────────────────────────┐
-│     TCP CLIENT          │         │     TCP SERVER         │
-│                         │         │                         │
-│ ┌─────────────────────┐ │         │  main() process         │
-│ │   Send Thread       │ │◄────────┤  accept() loop          │
-│ │   (user input)      │ │         │  fork() on connection   │
-│ └─────────────────────┘ │         │                         │
-│ ┌─────────────────────┐ │         │  ┌─────────────────────┐│
-│ │   Recv Thread       │ │◄────────┤  │ Child Process       ││
-│ │   (server messages) │ │         │  │ handle_client()     ││
-│ └─────────────────────┘ │         │  │ echo messages       ││
-│                         │         │  └─────────────────────┘│
-└─────────────────────────┘         └─────────────────────────┘
-```
-
-### Wire Protocol
-All messages use a 12-byte header followed by payload:
-
-```c
-typedef struct {
-    uint8_t  version;       /* Protocol version (0x01) */
-    uint8_t  msg_type;      /* Message type */
-    uint16_t flags;         /* Reserved */
-    uint32_t payload_len;   /* Payload length (network byte order) */
-    uint32_t checksum;      /* CRC32 of payload (network byte order) */
-} MsgHeader;
-```
-
-## Project Structure
-
-```
-secure-chat/
-├── AGENTS.md              ← Complete specification 
-├── README.md              ← This file
-├── Makefile               ← Build system
-│
-├── include/               ← Header files
-│   ├── common.h           ← Constants and shared definitions
-│   ├── message.h          ← Wire protocol structures  
-│   ├── socket_utils.h     ← TCP socket utilities
-│   ├── client.h           ← Client functions and state
-│   ├── server.h           ← Server functions
-│   ├── crypto.h           ← Cryptographic functions (Phase 3+)
-│   ├── tls_layer.h        ← TLS wrapper functions (Phase 5+)
-│   ├── udp_notify.h       ← UDP notifications (Phase 6+)
-│   └── dns_resolver.h     ← DNS resolution (Phase 2+)
-│
-├── src/
-│   ├── server/
-│   │   └── server.c       ← ✅ Fork-based TCP server
-│   ├── client/  
-│   │   └── client.c       ← ✅ Multi-threaded TCP client
-│   ├── net/
-│   │   ├── socket_utils.c ← ✅ TCP socket utilities
-│   │   └── message_utils.c← ✅ CRC32 message validation
-│   ├── crypto/            ← Future: RSA, AES, DH (Phase 3+)
-│   └── tls/               ← Future: TLS wrapper (Phase 5+)
-│
-├── bin/                   ← Compiled executables
-├── tests/                 ← Unit tests (Phase 7)
-└── certs/                 ← TLS certificates (Phase 5+)
-```
-
-## Usage Examples
-
-### Basic Echo Test
 ```bash
-# Start server
-./bin/server_phase1
-
-# Connect client and type messages  
-./bin/client_phase1 alice
-> Hello, server!
-Echo: Hello, server!
-> This is a test message
-Echo: This is a test message
+./bin/client localhost 8080 alice
 ```
 
-### Concurrent Clients Test
+Terminal 3 (client B):
+
 ```bash
-# Start server in one terminal
-./bin/server_phase1
-
-# Connect multiple clients simultaneously
-./bin/client_phase1 alice &
-./bin/client_phase1 bob &  
-./bin/client_phase1 charlie &
-
-# Each client can send/receive independently
+./bin/client localhost 8080 bob
 ```
+
+PowerShell equivalent (each command in a separate PowerShell terminal):
+
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/server"
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 alice"
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 bob"
+```
+
+Client usage notes:
+
+- Type a message and press Enter to send.
+- Use `/quit` to disconnect cleanly.
+
+## Detailed Test Workflow
+
+## 1) Fast Build Validation
+
+```bash
+make clean
+make all
+```
+
+Checks:
+
+- `bin/server` exists
+- `bin/client` exists
+- `certs/server.crt`, `certs/server.key`, `certs/ca.crt` exist
+
+## 2) Run Unit Tests
+
+Build and run all unit tests:
+
+```bash
+make test
+```
+
+PowerShell (via WSL):
+
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make test"
+```
+
+This runs:
+
+- `./bin/test_ratchet`
+- `./bin/test_crypto`
+- `./bin/test_adaptive`
+- `./bin/test_multipath`
+
+Run one test directly:
+
+```bash
+./bin/test_crypto
+```
+
+Pass condition: process exits with code `0`.
+
+## 3) Manual End-to-End Smoke Test
+
+1. Start server in terminal A:
+
+```bash
+./bin/server
+```
+
+2. Start client in terminal B:
+
+```bash
+./bin/client localhost 8080 testuser
+```
+
+3. Send a few messages from client.
+
+Expected:
+
+- Client establishes connection and authenticates.
+- Messages are processed without crash.
+- Server remains running and logs message handling.
+
+## 4) Two-Client Concurrency Check
+
+1. Server in terminal A.
+2. Start two clients with different usernames.
+3. Send messages from both clients quickly.
+
+Expected:
+
+- Both clients remain connected.
+- Server does not crash or hang.
+- Message processing continues for both sessions.
+
+## 5) Scripted Feature Check (WSL/Linux)
+
+A helper script exists:
+
+```bash
+chmod +x test_all_features.sh
+./test_all_features.sh
+```
+
+PowerShell (via WSL):
+
+```powershell
+wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "chmod +x test_all_features.sh && ./test_all_features.sh"
+```
+
+Notes:
+
+- Script assumes Linux paths and commands.
+- Run it from WSL or Linux, not native cmd.exe.
+
+## 6) Inspect Exit Codes In CI/Automation
+
+Example:
+
+```bash
+make tests && ./bin/test_ratchet && ./bin/test_crypto && ./bin/test_adaptive && ./bin/test_multipath
+```
+
+Use non-zero exit code as failure signal.
 
 ## Troubleshooting
 
-### Common Issues
+Connection refused:
 
-**Connection refused:**
+- Ensure server is running before client.
+- Confirm server port (`8080`) is not occupied.
+
+TLS/certificate failures:
+
 ```bash
-# Check if server is running
-ps aux | grep server_phase1
-
-# Check port usage
-netstat -tulpn | grep 8080
+make certs
 ```
 
-**Permission denied:**
+Then retry server and client.
+
+Build fails due to OpenSSL headers/libs:
+
 ```bash
-# Make binaries executable
-chmod +x bin/server_phase1 bin/client_phase1
+sudo apt-get install -y libssl-dev pkg-config
+pkg-config --cflags --libs openssl
 ```
 
-**Build errors:**
+Windows native shell issues:
+
+- Prefer WSL Ubuntu for runtime and tests.
+- If using Git Bash/MSYS2, ensure OpenSSL dev libraries are available and compatible.
+
+## Useful Make Targets
+
 ```bash
-# Clean and rebuild
-make clean
-make phase1
+make help
 ```
 
-## Next Steps
+Common targets:
 
-After Phase 1 completion, the implementation will proceed to:
+- `make all`
+- `make tests`
+- `make test`
+- `make clean`
+- `make certs`
+- `make debug`
+- `make release`
 
-1. **Phase 2**: Add DNS resolution and structured messaging
-2. **Phase 3**: Implement RSA authentication and Diffie-Hellman key exchange
-3. **Phase 4**: Add AES-256 message encryption
-4. **Phase 5**: Wrap connections in TLS 1.3
-5. **Phase 6**: Add UDP notifications and group chat rooms
-6. **Phase 7**: Comprehensive testing and optimization
+## Recommended Verification Order
 
-## Security Features (Coming in Later Phases)
+1. `make clean && make all`
+2. `make test`
+3. Manual server/client smoke run
+4. Optional: `./test_all_features.sh`
 
-- 🔒 RSA-2048 digital signatures for authentication
-- 🔒 Diffie-Hellman key exchange (RFC 3526 Group 14)  
-- 🔒 AES-256-CBC encryption with fresh IVs
-- 🔒 TLS 1.3 transport security
-- 🔒 CRC32 message integrity validation
-- 🔒 Certificate-based server authentication
-
-## License
-
-This is an educational project for Network Programming coursework.
+This sequence gives fast confidence in build health, crypto logic, adaptive logic, and runtime startup behavior.

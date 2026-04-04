@@ -213,12 +213,109 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
                     continue;
                 }
                 
-                /* Echo back (simplified - would route to recipient) */
-                printf("[Server] Echoing message from %s (len=%u)\n", username, payload_len);
+                /* Extract IV and ciphertext from received payload */
+                uint8_t *recv_iv = encrypted;
+                uint8_t *recv_ciphertext = encrypted + AES_IV_LEN;
+                int recv_ciphertext_len = payload_len - AES_IV_LEN;
                 
-                tls_send(ssl, &hdr, sizeof(hdr));
-                tls_send(ssl, encrypted, payload_len);
+                /* Derive message key for decryption using server's recv chain */
+                uint8_t recv_msg_key[RATCHET_KEY_LEN];
+                if (ratchet_recv_step(&ratchet, recv_msg_key) != SUCCESS) {
+                    fprintf(stderr, "[Server] Ratchet recv step failed\n");
+                    OPENSSL_cleanse(recv_msg_key, sizeof(recv_msg_key));
+                    free(encrypted);
+                    continue;
+                }
                 
+                /* Decrypt the message */
+                uint8_t plaintext_buf[MSG_PADDED_SIZE + 64];
+                int plaintext_len = aes_decrypt(recv_msg_key, recv_iv, recv_ciphertext, 
+                                                recv_ciphertext_len, plaintext_buf);
+                OPENSSL_cleanse(recv_msg_key, sizeof(recv_msg_key));
+                
+                if (plaintext_len < 0) {
+                    fprintf(stderr, "[Server] Decryption failed\n");
+                    free(encrypted);
+                    continue;
+                }
+                
+                /* Unpad the message */
+                uint8_t unpadded[MSG_PADDED_SIZE];
+                int unpadded_len = msg_unpad(plaintext_buf, plaintext_len, unpadded);
+                if (unpadded_len < 0) {
+                    fprintf(stderr, "[Server] Unpadding failed\n");
+                    free(encrypted);
+                    continue;
+                }
+                
+                printf("[Server] Received message from %s: %.*s\n", username, unpadded_len, unpadded);
+                
+                /* For echo: re-encrypt using server's send chain */
+                /* Pad the message */
+                uint8_t padded[MSG_PADDED_SIZE];
+                if (msg_pad(unpadded, unpadded_len, padded) != SUCCESS) {
+                    fprintf(stderr, "[Server] Padding failed\n");
+                    free(encrypted);
+                    continue;
+                }
+                
+                /* Generate new IV for sending */
+                uint8_t send_iv[AES_IV_LEN];
+                if (aes_generate_iv(send_iv) != SUCCESS) {
+                    fprintf(stderr, "[Server] Failed to generate IV\n");
+                    free(encrypted);
+                    continue;
+                }
+                
+                /* Derive message key for encryption using server's send chain */
+                uint8_t send_msg_key[RATCHET_KEY_LEN];
+                if (ratchet_send_step(&ratchet, send_msg_key) != SUCCESS) {
+                    fprintf(stderr, "[Server] Ratchet send step failed\n");
+                    OPENSSL_cleanse(send_msg_key, sizeof(send_msg_key));
+                    free(encrypted);
+                    continue;
+                }
+                
+                /* Encrypt the message */
+                uint8_t send_ciphertext[MSG_PADDED_SIZE + 64];
+                int send_ciphertext_len = aes_encrypt(send_msg_key, send_iv, padded, 
+                                                      MSG_PADDED_SIZE, send_ciphertext);
+                OPENSSL_cleanse(send_msg_key, sizeof(send_msg_key));
+                
+                if (send_ciphertext_len < 0) {
+                    fprintf(stderr, "[Server] Encryption failed\n");
+                    free(encrypted);
+                    continue;
+                }
+                
+                /* Build response payload: IV + ciphertext */
+                uint8_t *response = malloc(AES_IV_LEN + send_ciphertext_len);
+                if (!response) {
+                    fprintf(stderr, "[Server] Memory allocation failed\n");
+                    free(encrypted);
+                    continue;
+                }
+                memcpy(response, send_iv, AES_IV_LEN);
+                memcpy(response + AES_IV_LEN, send_ciphertext, send_ciphertext_len);
+                
+                /* Build response header */
+                MsgHeader resp_hdr = {
+                    .version = PROTOCOL_VERSION,
+                    .msg_type = MSG_CHAT,
+                    .priority = hdr.priority,
+                    .flags = 0,
+                    .payload_len = htonl(AES_IV_LEN + send_ciphertext_len),
+                    .checksum = 0
+                };
+                generate_random_bytes(resp_hdr.msg_id, MSG_ID_LEN);
+                
+                printf("[Server] Echoing message back to %s (len=%d)\n", username, 
+                       AES_IV_LEN + send_ciphertext_len);
+                
+                tls_send(ssl, &resp_hdr, sizeof(resp_hdr));
+                tls_send(ssl, response, AES_IV_LEN + send_ciphertext_len);
+                
+                free(response);
                 free(encrypted);
                 break;
             }

@@ -102,7 +102,7 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
     client->ssl = tls_wrap_client_socket(client->ssl_ctx, client->tcp_socket, hostname);
     if (!client->ssl) {
         fprintf(stderr, "TLS handshake failed\n");
-        SSL_CTX_free(client->ssl_ctx);
+        tls_free_ctx(client->ssl_ctx);
         close(client->tcp_socket);
         return -1;
     }
@@ -114,7 +114,7 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
     if (!client->rsa_keypair) {
         fprintf(stderr, "Failed to generate RSA keypair\n");
         tls_close(client->ssl);
-        SSL_CTX_free(client->ssl_ctx);
+        tls_free_ctx(client->ssl_ctx);
         return -1;
     }
 
@@ -571,7 +571,7 @@ void client_cleanup(ClientState *client) {
     }
     
     if (client->ssl_ctx) {
-        SSL_CTX_free(client->ssl_ctx);
+        tls_free_ctx(client->ssl_ctx);
         client->ssl_ctx = NULL;
     }
     
@@ -636,8 +636,8 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_shutdown);
     signal(SIGTERM, handle_shutdown);
 
-    /* Initialize OpenSSL (using newer API for OpenSSL 1.1.0+) */
-    if (!OPENSSL_init_ssl(0, NULL)) {
+    /* Initialize OpenSSL */
+    if (tls_init() != SUCCESS) {
         fprintf(stderr, "Failed to initialize OpenSSL\n");
         return 1;
     }
