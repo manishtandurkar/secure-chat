@@ -38,36 +38,6 @@ sudo apt-get update
 sudo apt-get install -y gcc make libssl-dev pkg-config
 ```
 
-### Windows (PowerShell)
-
-This project is Linux-first. On Windows, use one of the two paths below.
-
-#### Recommended: WSL from PowerShell
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "sudo apt-get update && sudo apt-get install -y gcc make libssl-dev pkg-config"
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make clean && make all && make test"
-```
-
-Run server/client from PowerShell via WSL:
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/server"
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 alice"
-```
-
-#### Native Windows (advanced/optional)
-
-Native builds may require extra setup (OpenSSL dev libs, compatible toolchain, and path adjustments). If you use native Windows tools, verify:
-
-```powershell
-gcc --version
-make --version
-pkg-config --modversion openssl
-```
-
-If any of these fail or OpenSSL linkage errors appear, use the WSL path above.
-
 ### Verify Toolchain
 
 ```bash
@@ -76,11 +46,6 @@ make --version
 pkg-config --modversion openssl
 ```
 
-PowerShell tip for WSL toolchain check:
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "gcc --version && make --version && pkg-config --modversion openssl"
-```
 
 ## Build Instructions
 
@@ -91,11 +56,6 @@ make clean
 make all
 ```
 
-From PowerShell (using WSL):
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make clean && make all"
-```
 
 What `make all` does:
 
@@ -143,14 +103,6 @@ Terminal 3 (client B):
 
 ```bash
 ./bin/client localhost 8080 bob
-```
-
-PowerShell equivalent (each command in a separate PowerShell terminal):
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/server"
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 alice"
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "./bin/client localhost 8080 bob"
 ```
 
 Client usage notes:
@@ -245,11 +197,6 @@ chmod +x test_all_features.sh
 ./test_all_features.sh
 ```
 
-PowerShell (via WSL):
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "chmod +x test_all_features.sh && ./test_all_features.sh"
-```
 
 Notes:
 
