@@ -29,8 +29,6 @@ void engine_apply_mode(EngineState *state, AdaptiveMode new_mode) {
         return;
     }
     
-    pthread_mutex_lock(&engine_mutex);
-    
     state->mode = new_mode;
     
     switch (new_mode) {

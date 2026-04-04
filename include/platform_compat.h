@@ -36,6 +36,7 @@
 #include <windows.h>
 #include <io.h>
 #include <process.h>
+#include <stdio.h>
 
 /* Link against Winsock library */
 #pragma comment(lib, "ws2_32.lib")
