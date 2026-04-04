@@ -133,12 +133,6 @@ Build and run all unit tests:
 make test
 ```
 
-PowerShell (via WSL):
-
-```powershell
-wsl --cd /mnt/c/Projects/Lab/NPS/EL/Project bash -lc "make test"
-```
-
 This runs:
 
 - `./bin/test_ratchet`
