@@ -122,3 +122,5 @@ cscope.*
 # Dependency directories
 .deps/
 vendor/
+
+nul
