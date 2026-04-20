@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -25,6 +26,34 @@
 
 /* Global client state for signal handlers */
 static ClientState *g_client = NULL;
+static ClientLogCallback g_log_callback = NULL;
+static void *g_log_user_data = NULL;
+
+void client_set_log_callback(ClientLogCallback callback, void *user_data) {
+    g_log_callback = callback;
+    g_log_user_data = user_data;
+}
+
+static void client_log_line(const char *line) {
+    if (g_log_callback) {
+        g_log_callback(line, g_log_user_data);
+        return;
+    }
+
+    printf("%s\n", line);
+    fflush(stdout);
+}
+
+static void client_log_format(const char *format, ...) {
+    char buffer[1024];
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    client_log_line(buffer);
+}
 
 /* Signal handler for graceful shutdown */
 void handle_shutdown(int sig) {
@@ -89,7 +118,7 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
         return -1;
     }
 
-    printf("[+] Connected to %s:%d\n", ip_str, port);
+    client_log_format("[+] Connected to %s:%d", ip_str, port);
 
     /* Setup TLS */
     client->ssl_ctx = tls_create_client_ctx("certs/ca.crt");
@@ -107,7 +136,7 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
         return -1;
     }
 
-    printf("[+] TLS 1.3 handshake complete\n");
+    client_log_line("[+] TLS 1.3 handshake complete");
 
     /* Generate RSA keypair for authentication */
     client->rsa_keypair = rsa_generate_keypair();
@@ -194,7 +223,7 @@ int perform_dh_exchange(ClientState *client) {
         return -1;
     }
 
-    printf("[+] DH exchange complete\n");
+    client_log_line("[+] DH exchange complete");
 
     /* Derive shared secret */
     uint8_t shared_secret[32];
@@ -222,7 +251,7 @@ int perform_dh_exchange(ClientState *client) {
         return -1;
     }
 
-    printf("[+] Ratchet initialized\n");
+    client_log_line("[+] Ratchet initialized");
 
     /* Cleanup */
     OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
@@ -292,7 +321,7 @@ int authenticate_with_server(ClientState *client) {
     }
 
     if (resp_hdr.msg_type == MSG_AUTH_OK) {
-        printf("[+] Authentication successful\n");
+        client_log_line("[+] Authentication successful");
         return 0;
     } else if (resp_hdr.msg_type == MSG_AUTH_FAIL) {
         fprintf(stderr, "Authentication failed\n");
@@ -388,13 +417,57 @@ void *recv_thread_func(void *arg) {
                 continue;
             }
 
-            /* Display message */
+            /* Display message with priority marker */
             unpadded[unpadded_len] = '\0';
-            printf("\n[MSG] %s\n> ", (char *)unpadded);
-            fflush(stdout);
+            const char *prio = "NORMAL";
+            if (hdr.priority == PRIORITY_URGENT) {
+                prio = "URGENT";
+            } else if (hdr.priority == PRIORITY_CRITICAL) {
+                prio = "CRITICAL";
+            }
+            client_log_format("[MSG][%s] %s", prio, (char *)unpadded);
+
+            if (!g_log_callback) {
+                printf("> ");
+                fflush(stdout);
+            }
 
         } else if (hdr.msg_type == MSG_ERROR) {
-            fprintf(stderr, "[!] Server error\n");
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len > 0 && payload_len < 2048) {
+                uint8_t *msg = malloc(payload_len + 1);
+                if (msg && tls_recv(client->ssl, msg, payload_len) == (int)payload_len) {
+                    msg[payload_len] = '\0';
+                    client_log_format("[SERVER] %s", (char *)msg);
+                }
+                free(msg);
+            } else {
+                client_log_line("[SERVER] Error");
+            }
+        } else if (hdr.msg_type == MSG_OFFLINE_STORED) {
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len > 0 && payload_len < 2048) {
+                uint8_t *msg = malloc(payload_len + 1);
+                if (msg && tls_recv(client->ssl, msg, payload_len) == (int)payload_len) {
+                    msg[payload_len] = '\0';
+                    client_log_format("[QUEUE] %s", (char *)msg);
+                }
+                free(msg);
+            } else {
+                client_log_line("[QUEUE] Message stored for offline recipient");
+            }
+        } else if (hdr.msg_type == MSG_USER_LIST_RESP) {
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len > 0 && payload_len < 4096) {
+                uint8_t *msg = malloc(payload_len + 1);
+                if (msg && tls_recv(client->ssl, msg, payload_len) == (int)payload_len) {
+                    msg[payload_len] = '\0';
+                    client_log_format("[USERS] %s", (char *)msg);
+                }
+                free(msg);
+            } else {
+                client_log_line("[USERS]");
+            }
         } else {
             /* Skip unknown message types */
             uint32_t payload_len = ntohl(hdr.payload_len);
@@ -416,8 +489,10 @@ void *send_thread_func(void *arg) {
     ClientState *client = (ClientState *)arg;
     char input_buf[MAX_MSG_LEN];
 
-    printf("\n> ");
-    fflush(stdout);
+    if (!g_log_callback) {
+        printf("\n> ");
+        fflush(stdout);
+    }
 
     while (client->running && fgets(input_buf, sizeof(input_buf), stdin)) {
         /* Remove trailing newline */
@@ -428,8 +503,10 @@ void *send_thread_func(void *arg) {
         }
 
         if (len == 0) {
-            printf("> ");
-            fflush(stdout);
+            if (!g_log_callback) {
+                printf("> ");
+                fflush(stdout);
+            }
             continue;
         }
 
@@ -443,8 +520,10 @@ void *send_thread_func(void *arg) {
         uint8_t padded[MSG_PADDED_SIZE];
         if (msg_pad((uint8_t *)input_buf, len, padded) != 0) {
             fprintf(stderr, "[!] Padding failed\n");
-            printf("> ");
-            fflush(stdout);
+            if (!g_log_callback) {
+                printf("> ");
+                fflush(stdout);
+            }
             continue;
         }
 
@@ -455,8 +534,10 @@ void *send_thread_func(void *arg) {
             pthread_mutex_unlock(&client->ratchet_lock);
             fprintf(stderr, "[!] Ratchet send step failed\n");
             OPENSSL_cleanse(msg_key, sizeof(msg_key));
-            printf("> ");
-            fflush(stdout);
+            if (!g_log_callback) {
+                printf("> ");
+                fflush(stdout);
+            }
             continue;
         }
         pthread_mutex_unlock(&client->ratchet_lock);
@@ -466,8 +547,10 @@ void *send_thread_func(void *arg) {
         if (aes_generate_iv(iv) != 0) {
             fprintf(stderr, "[!] IV generation failed\n");
             OPENSSL_cleanse(msg_key, sizeof(msg_key));
-            printf("> ");
-            fflush(stdout);
+            if (!g_log_callback) {
+                printf("> ");
+                fflush(stdout);
+            }
             continue;
         }
 
@@ -518,8 +601,10 @@ void *send_thread_func(void *arg) {
             break;
         }
 
-        printf("> ");
-        fflush(stdout);
+        if (!g_log_callback) {
+            printf("> ");
+            fflush(stdout);
+        }
     }
 
     return NULL;
@@ -619,6 +704,100 @@ int load_ratchet_state(ClientState *client) {
 }
 
 /* Main client entry point */
+int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority) {
+    size_t len = strlen(input_buf);
+
+    if (len == 0) {
+        return 0;
+    }
+
+    uint8_t padded[MSG_PADDED_SIZE];
+    if (msg_pad((uint8_t *)input_buf, len, padded) != 0) {
+        client_log_line("[!] Padding failed");
+        return -1;
+    }
+
+    uint8_t msg_key[RATCHET_KEY_LEN];
+    pthread_mutex_lock(&client->ratchet_lock);
+    if (ratchet_send_step(&client->ratchet, msg_key) != 0) {
+        pthread_mutex_unlock(&client->ratchet_lock);
+        client_log_line("[!] Ratchet send step failed");
+        OPENSSL_cleanse(msg_key, sizeof(msg_key));
+        return -1;
+    }
+    pthread_mutex_unlock(&client->ratchet_lock);
+
+    uint8_t iv[AES_IV_LEN];
+    if (aes_generate_iv(iv) != 0) {
+        client_log_line("[!] IV generation failed");
+        OPENSSL_cleanse(msg_key, sizeof(msg_key));
+        return -1;
+    }
+
+    uint8_t ciphertext[MSG_PADDED_SIZE + 64];
+    int ciphertext_len = aes_encrypt(msg_key, iv, padded, MSG_PADDED_SIZE, ciphertext);
+    OPENSSL_cleanse(msg_key, sizeof(msg_key));
+
+    if (ciphertext_len < 0) {
+        client_log_line("[!] Encryption failed");
+        return -1;
+    }
+
+    size_t payload_len = AES_IV_LEN + (size_t)ciphertext_len;
+    uint8_t *payload = malloc(payload_len);
+    if (!payload) {
+        perror("malloc");
+        return -1;
+    }
+
+    memcpy(payload, iv, AES_IV_LEN);
+    memcpy(payload + AES_IV_LEN, ciphertext, (size_t)ciphertext_len);
+
+    MsgHeader hdr = {0};
+    hdr.version = MSG_VERSION;
+    hdr.msg_type = MSG_CHAT;
+    hdr.priority = priority;
+    RAND_bytes(hdr.msg_id, MSG_ID_LEN);
+    hdr.payload_len = htonl((uint32_t)payload_len);
+
+    int send_ok = 0;
+    if (tls_send(client->ssl, &hdr, sizeof(hdr)) == (int)sizeof(hdr) &&
+        tls_send(client->ssl, payload, (int)payload_len) == (int)payload_len) {
+        send_ok = 1;
+    }
+
+    free(payload);
+
+    if (!send_ok) {
+        client_log_line("[!] Send failed");
+        client->running = 0;
+        return -1;
+    }
+
+    return 0;
+}
+
+int client_send_chat_message(ClientState *client, const char *input_buf) {
+    return client_send_chat_message_ex(client, input_buf, PRIORITY_NORMAL);
+}
+
+int client_request_user_list(ClientState *client) {
+    MsgHeader hdr = {0};
+    hdr.version = MSG_VERSION;
+    hdr.msg_type = MSG_USER_LIST_REQ;
+    hdr.priority = PRIORITY_NORMAL;
+    RAND_bytes(hdr.msg_id, MSG_ID_LEN);
+    hdr.payload_len = htonl(0);
+
+    if (tls_send(client->ssl, &hdr, sizeof(hdr)) != (int)sizeof(hdr)) {
+        client_log_line("[!] Failed to request online user list");
+        return -1;
+    }
+
+    return 0;
+}
+
+#ifndef CLIENT_NO_MAIN
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <hostname> <port> <username>\n", argv[0]);
@@ -681,3 +860,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+#endif

@@ -31,6 +31,8 @@ CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -g \
           $(shell pkg-config --cflags openssl 2>nul || echo -I/usr/include)
 LDFLAGS = $(shell pkg-config --libs openssl 2>nul || echo -lssl -lcrypto) \
           -lpthread $(LDFLAGS_PLATFORM)
+GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>nul)
+GTK_LDFLAGS = $(shell pkg-config --libs gtk+-3.0 2>nul)
 
 # Source file groups
 SRC_COMMON = src/crypto/rsa_utils.c src/crypto/aes_utils.c \
@@ -50,6 +52,8 @@ SRC_SERVER = src/server/server.c src/server/client_handler.c \
 SRC_CLIENT = src/client/client.c src/client/input_handler.c \
              src/client/display.c
 
+SRC_GTK_CLIENT = src/client/client.c src/client/gtk_client.c
+
 # Phase 1 - Basic TCP only (no crypto/TLS dependencies)
 SRC_PHASE1_COMMON = src/net/socket_utils.c src/net/message_utils.c
 SRC_PHASE1_SERVER = src/server/server.c  
@@ -59,6 +63,7 @@ SRC_PHASE1_CLIENT = src/client/client.c
 OBJ_COMMON = $(SRC_COMMON:.c=.o)
 OBJ_SERVER = $(SRC_SERVER:.c=.o)
 OBJ_CLIENT = $(SRC_CLIENT:.c=.o)
+OBJ_GTK_CLIENT = src/client/client_gui.o src/client/gtk_client.o
 
 OBJ_PHASE1_COMMON = $(SRC_PHASE1_COMMON:.c=.o)
 OBJ_PHASE1_SERVER = $(SRC_PHASE1_SERVER:.c=.o)
@@ -66,6 +71,8 @@ OBJ_PHASE1_CLIENT = $(SRC_PHASE1_CLIENT:.c=.o)
 
 # Default target
 all: bin server client certs
+
+gtk-client: bin bin/client_gtk
 
 # Phase 1 targets (no crypto/TLS dependencies)
 phase1: bin phase1-server phase1-client
@@ -95,6 +102,15 @@ client: bin bin/client
 
 bin/client: $(OBJ_CLIENT) $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+src/client/client_gui.o: src/client/client.c
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) -DCLIENT_NO_MAIN -c $< -o $@
+
+src/client/gtk_client.o: src/client/gtk_client.c
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c $< -o $@
+
+bin/client_gtk: $(OBJ_GTK_CLIENT) $(OBJ_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GTK_LDFLAGS)
 
 # Generate TLS certificates
 certs:
@@ -126,7 +142,8 @@ bin/test_multipath: tests/test_multipath.c $(OBJ_COMMON)
 clean:
 	rm -f $(OBJ_COMMON) $(OBJ_SERVER) $(OBJ_CLIENT)
 	rm -f $(OBJ_PHASE1_COMMON) $(OBJ_PHASE1_SERVER) $(OBJ_PHASE1_CLIENT)
-	rm -f bin/server bin/client bin/server_phase1 bin/client_phase1 bin/test_*
+	rm -f src/client/client_gui.o src/client/gtk_client.o
+	rm -f bin/server bin/client bin/client_gtk bin/server_phase1 bin/client_phase1 bin/test_*
 
 # Clean everything including certificates
 clean-all: clean
@@ -161,6 +178,7 @@ help:
 	@echo "  phase1       - Build Phase 1 TCP echo server and client"
 	@echo "  server       - Build server only"
 	@echo "  client       - Build client only"
+	@echo "  gtk-client   - Build GTK client only"
 	@echo "  tests        - Build test executables"
 	@echo "  certs        - Generate TLS certificates"
 	@echo "  clean        - Remove build artifacts"
@@ -171,4 +189,4 @@ help:
 	@echo "  release      - Build optimized release version"
 	@echo "  help         - Show this help message"
 
-.PHONY: all server client tests certs clean clean-all install-deps test debug release help phase1 phase1-server phase1-client
+.PHONY: all server client gtk-client tests certs clean clean-all install-deps test debug release help phase1 phase1-server phase1-client

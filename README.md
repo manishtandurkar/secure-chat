@@ -38,6 +38,12 @@ sudo apt-get update
 sudo apt-get install -y gcc make libssl-dev pkg-config
 ```
 
+For the GTK demo UI, also install:
+
+```bash
+sudo apt-get install -y libgtk-3-dev
+```
+
 ### Verify Toolchain
 
 ```bash
@@ -77,6 +83,12 @@ make server
 make client
 ```
 
+Build the GTK demo client:
+
+```bash
+make gtk-client
+```
+
 Build phase-1 TCP-only binaries:
 
 ```bash
@@ -109,6 +121,44 @@ Client usage notes:
 
 - Type a message and press Enter to send.
 - Use `/quit` to disconnect cleanly.
+
+GTK demo client:
+
+```bash
+./bin/client_gtk
+```
+
+Use the GTK window to enter host, port, username, and recipient username (`To`).
+
+New GTK feature:
+
+- Live `Online Users` panel.
+- Click any online user to auto-fill the `To` field.
+- `Refresh Users` button and periodic auto-refresh keep the list up to date.
+
+Directed messaging behavior:
+
+- Messages are now routed to specific clients only.
+- Message format on wire is directed (`@recipient message`).
+- GTK handles this automatically from the `To` field.
+- If recipient is offline, server sends queue confirmation and stores message in offline queue.
+
+Additional useful use cases:
+
+- Broadcast announcement: enable `Broadcast to all online users` and send one message to everyone currently online.
+- Priority escalation: choose `NORMAL`, `URGENT`, or `CRITICAL` before sending.
+- Quick action presets in GTK:
+	- `Emergency Broadcast` (broadcast + CRITICAL)
+	- `Status Check` (direct + URGENT)
+	- `Team Sync` (broadcast + NORMAL)
+
+Priority is visible on received messages in logs as `[MSG][NORMAL|URGENT|CRITICAL]`.
+
+Example:
+
+- Client `alice` sets `To = bob` and sends `hello`.
+- Only `bob` receives it.
+- `alice` does not get self-echo.
 
 ## Detailed Test Workflow
 

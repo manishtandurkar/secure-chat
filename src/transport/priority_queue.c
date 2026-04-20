@@ -7,8 +7,7 @@
 #define MAX_QUEUE_SIZE 1000
 
 static QueuedMessage queue[MAX_QUEUE_SIZE];
-static int queue_front = 0;
-static int queue_rear = 0;
+static QueuedMessage dequeued_message;
 static int queue_count = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
@@ -28,8 +27,6 @@ int pq_init(void) {
     }
     
     memset(queue, 0, sizeof(queue));
-    queue_front = 0;
-    queue_rear = 0;
     queue_count = 0;
     queue_initialized = 1;
     
@@ -50,16 +47,26 @@ int pq_enqueue(QueuedMessage *msg) {
     }
     
     msg->enqueue_time_ms = get_time_ms();
-    
-    /* For CRITICAL priority, insert at front */
-    if (msg->priority == PRIORITY_CRITICAL && queue_count > 0) {
-        queue_front = (queue_front - 1 + MAX_QUEUE_SIZE) % MAX_QUEUE_SIZE;
-        memcpy(&queue[queue_front], msg, sizeof(QueuedMessage));
-    } else {
-        /* Normal enqueue at rear */
-        memcpy(&queue[queue_rear], msg, sizeof(QueuedMessage));
-        queue_rear = (queue_rear + 1) % MAX_QUEUE_SIZE;
+
+    /* Keep the queue ordered by priority while preserving FIFO within each priority. */
+    int insert_index = 0;
+    while (insert_index < queue_count &&
+           queue[insert_index].priority > msg->priority) {
+        insert_index++;
     }
+
+    while (insert_index < queue_count &&
+           queue[insert_index].priority == msg->priority) {
+        insert_index++;
+    }
+
+    if (insert_index < queue_count) {
+        memmove(&queue[insert_index + 1],
+                &queue[insert_index],
+                (size_t)(queue_count - insert_index) * sizeof(QueuedMessage));
+    }
+
+    memcpy(&queue[insert_index], msg, sizeof(QueuedMessage));
     
     queue_count++;
     
@@ -79,14 +86,18 @@ QueuedMessage *pq_dequeue(void) {
         pthread_cond_wait(&queue_cond, &queue_mutex);
     }
     
-    /* Return pointer to front message */
-    QueuedMessage *msg = &queue[queue_front];
-    queue_front = (queue_front + 1) % MAX_QUEUE_SIZE;
+    /* Return pointer to a stable internal copy of the highest-priority message. */
+    memcpy(&dequeued_message, &queue[0], sizeof(QueuedMessage));
+
+    if (queue_count > 1) {
+        memmove(&queue[0], &queue[1], (size_t)(queue_count - 1) * sizeof(QueuedMessage));
+    }
+
     queue_count--;
     
     pthread_mutex_unlock(&queue_mutex);
     
-    return msg;
+    return &dequeued_message;
 }
 
 /* Get current queue size */
@@ -102,8 +113,6 @@ int pq_size(void) {
 void pq_destroy(void) {
     pthread_mutex_lock(&queue_mutex);
     queue_initialized = 0;
-    queue_front = 0;
-    queue_rear = 0;
     queue_count = 0;
     memset(queue, 0, sizeof(queue));
     pthread_mutex_unlock(&queue_mutex);

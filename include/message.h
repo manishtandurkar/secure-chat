@@ -21,6 +21,8 @@ typedef enum {
     MSG_OFFLINE_STORED = 0x0D,  /* NEW: server confirms message queued for offline user */
     MSG_PRIORITY       = 0x0E,  /* NEW: urgent/critical message signal */
     MSG_ENGINE_STATE   = 0x0F,  /* NEW: server broadcasts current adaptive mode to clients */
+    MSG_USER_LIST_REQ  = 0x10,  /* Client requests current online user list */
+    MSG_USER_LIST_RESP = 0x11,  /* Server responds with comma-separated online users */
     MSG_ERROR          = 0xFF,  /* Error response */
 } MsgType;
 

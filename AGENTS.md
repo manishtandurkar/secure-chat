@@ -5,7 +5,7 @@
 > **Crypto Library:** OpenSSL 3.x
 > **Build System:** GCC + Makefile
 > **Transport:** TCP (primary) + UDP (multi-path backup)
-> **New vs Old:** Double Ratchet replaces static AES session key; Adaptive Engine, Multi-Path Delivery, Offline Queue, and Priority Messaging are new modules
+> **New vs Old:** Double Ratchet replaces static AES session key; Adaptive Engine, Multi-Path Delivery, Offline Queue, Priority Messaging, Directed Client Messaging, and a GTK Operator UI are new modules
 
 ---
 
@@ -87,6 +87,7 @@ adaptive-secure-chat/
 │   │
 │   ├── client/
 │   │   ├── client.c                 ← Main client: connect, threads, UI
+│   │   ├── gtk_client.c             ← GTK3 GUI client (directed send, online users list)
 │   │   ├── input_handler.c          ← Stdin → priority queue
 │   │   └── display.c                ← Render decrypted messages
 │   │
@@ -145,12 +146,12 @@ adaptive-secure-chat/
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                              SERVER PROCESS                              │
 │                                                                          │
-│  main() → socket/bind/listen → accept() loop → fork() per client        │
+│  main() → socket/bind/listen → accept() loop → pthread per client       │
 │                                                                          │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  CHILD PROCESS (client_handler)                                    │  │
+│  │  CLIENT THREAD (client_handler)                                    │  │
 │  │  TLS handshake → DH exchange → RSA auth → Ratchet init            │  │
-│  │  Route encrypted messages to recipients (or offline queue)         │  │
+│  │  Route directed encrypted messages (or offline queue)              │  │
 │  │  Feed metrics to Adaptive Engine                                   │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
@@ -187,12 +188,13 @@ adaptive-secure-chat/
 
 **File:** `src/server/server.c`
 
-Same fork-based architecture as baseline. Key additions:
+Current implementation uses a thread-per-connection architecture with `pthread_create`. Key additions:
 
 - Maintains **shared memory segment** (POSIX `shm_open`) for Adaptive Engine state, readable by all child processes
-- Maintains an **in-memory routing table**: `username → child_pid + pipe_fd` for routing messages between children
-- On `accept()`, passes connected fd to child via `fork()`. Child calls `client_handler(connfd)`
-- `SIGCHLD` handler calls `waitpid(-1, NULL, WNOHANG)` and removes dead entries from routing table
+- Maintains an **in-memory connected-client table**: `username → SSL* + ratchet state` for directed routing
+- On `accept()`, starts a detached thread that calls `handle_client(connfd, ...)`
+- Supports directed delivery (`@recipient message`), broadcast (`@all message`), and `MSG_USER_LIST_REQ/RESP`
+- Sends `MSG_OFFLINE_STORED` acknowledgement when recipient is offline and queueing succeeds
 
 **Constants (`include/common.h`):**
 ```c
@@ -231,12 +233,27 @@ Same fork-based architecture as baseline. Key additions:
 
 Usage: `./bin/client <hostname> <port> <username>`
 
+GTK usage: `./bin/client_gtk`
+
 Spawns three pthreads after connection:
 - **recv_thread** — reads from TLS socket, deduplicates by message ID, decrypts via ratchet, passes to display
 - **send_thread** — drains priority queue, encrypts via ratchet, sends via multipath
 - **udp_thread** — sends/receives UDP presence signals and backup message copies
 
 Persists ratchet state to `~/.aschat/<username>.ratchet` (AES-encrypted with a passphrase-derived key) after every message to survive crashes.
+
+Recent client-facing additions:
+- `client_send_chat_message_ex(..., priority)` for explicit NORMAL/URGENT/CRITICAL sends
+- `client_request_user_list(...)` to fetch online users from server
+- Optional GUI log callback (`client_set_log_callback`) for GTK integration
+- Receive path now surfaces `[MSG][PRIORITY] ...`, `[QUEUE] ...`, `[SERVER] ...`, and `[USERS] ...` messages
+
+GTK client capabilities (`src/client/gtk_client.c`):
+- Connect form (host/port/username) and directed `To` field
+- Online users side panel with click-to-fill recipient
+- Manual and timed refresh of user list
+- Broadcast toggle (`@all` routing)
+- Priority selector and quick action presets (`Emergency Broadcast`, `Status Check`, `Team Sync`)
 
 ---
 
@@ -683,6 +700,8 @@ typedef enum {
     MSG_OFFLINE_STORED = 0x0D,  /* NEW: server confirms message queued for offline user */
     MSG_PRIORITY       = 0x0E,  /* NEW: urgent/critical message signal */
     MSG_ENGINE_STATE   = 0x0F,  /* NEW: server broadcasts current adaptive mode to clients */
+   MSG_USER_LIST_REQ  = 0x10,  /* NEW: client requests online users */
+   MSG_USER_LIST_RESP = 0x11,  /* NEW: server responds with comma-separated users */
     MSG_ERROR          = 0xFF,
 } MsgType;
 ```
@@ -715,7 +734,8 @@ CLIENT                                          SERVER CHILD
   |                                                  |
   |    ======= CHAT SESSION ACTIVE ===============   |
   |                                                  |
-  | User types "Hello"                               |
+   | User types "Hello" (directed in client as        |
+   | `@recipient Hello`)                               |
   | ratchet_send_step() → msg_key                    |
   | aes_generate_iv() → iv                           |
   | msg_pad("Hello") → padded (4096 bytes)           |
@@ -725,7 +745,8 @@ CLIENT                                          SERVER CHILD
   |--- MSG_CHAT via TCP (TLS) -------------------→   |
   |--- MSG_CHAT via UDP (backup copy) ----------→    |
   |                                                  |
-  |    Server reads header → routes to recipient     |
+   |    Server decrypts payload, parses recipient      |
+   |    Server routes directed message to recipient    |
   |    (If recipient offline → queue_store())        |
   |                                                  |
   |    Recipient:                                    |
@@ -789,6 +810,11 @@ CLIENT                                          SERVER CHILD
 sudo apt-get install -y gcc make libssl-dev
 ```
 
+For GTK client builds:
+```bash
+sudo apt-get install -y libgtk-3-dev pkg-config
+```
+
 ### Makefile
 ```makefile
 CC      = gcc
@@ -840,10 +866,19 @@ clean:
 ```bash
 mkdir -p bin data/offline_queue
 make all
+make gtk-client
 ./bin/server                          # Terminal 1
 ./bin/client localhost 8080 alice     # Terminal 2
 ./bin/client localhost 8080 bob       # Terminal 3
+./bin/client_gtk                       # Optional GTK client
 ```
+
+### Directed Messaging Notes
+
+- Messages are routed to a specific recipient using `@username message`.
+- Broadcast to all online users uses `@all message`.
+- Server rejects self-targeting and returns `MSG_ERROR` guidance.
+- If target user is offline, payload is queued and sender receives `MSG_OFFLINE_STORED`.
 
 ---
 

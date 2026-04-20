@@ -29,6 +29,13 @@ typedef struct {
     pthread_mutex_t ratchet_lock;
 } ClientState;
 
+typedef void (*ClientLogCallback)(const char *line, void *user_data);
+
+/**
+ * Set an optional log callback used by GUI clients.
+ */
+void client_set_log_callback(ClientLogCallback callback, void *user_data);
+
 /**
  * Main client entry point
  * Usage: ./client <hostname> <port> <username>
@@ -49,6 +56,21 @@ int client_start_threads(ClientState *client);
  * Wait for client threads to finish
  */
 void client_join_threads(ClientState *client);
+
+/**
+ * Send a single chat message using the current ratchet state
+ */
+int client_send_chat_message(ClientState *client, const char *input_buf);
+
+/**
+ * Send a single chat message with explicit priority
+ */
+int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority);
+
+/**
+ * Request current online user list from server
+ */
+int client_request_user_list(ClientState *client);
 
 /**
  * Cleanup client resources

@@ -62,8 +62,6 @@ void engine_apply_mode(EngineState *state, AdaptiveMode new_mode) {
             state->dh_ratchet_freq = 1;
             break;
     }
-    
-    pthread_mutex_unlock(&engine_mutex);
 }
 
 /* Evaluate metrics and transition modes */

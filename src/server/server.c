@@ -9,9 +9,19 @@
 #include <string.h>
 #include <errno.h>
 
-#ifdef PLATFORM_WINDOWS
-#error "Server with fork() is not supported on Windows. Use a thread-based architecture or run on Linux."
-#endif
+typedef struct {
+    int connfd;
+    SSL_CTX *tls_ctx;
+    EngineState *engine;
+    Metrics *metrics;
+} ClientThreadArgs;
+
+static void *client_thread_main(void *arg) {
+    ClientThreadArgs *args = (ClientThreadArgs *)arg;
+    handle_client(args->connfd, args->tls_ctx, args->engine, args->metrics);
+    free(args);
+    return NULL;
+}
 
 /* Signal handler for SIGCHLD to reap zombie processes */
 void sigchld_handler(int sig) {
@@ -24,8 +34,6 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len;
     int opt = 1;
-    pid_t child_pid;
-    struct sigaction sa;
     SSL_CTX *tls_ctx = NULL;
     EngineState engine;
     Metrics metrics = {0};
@@ -53,16 +61,6 @@ int main(int argc, char *argv[]) {
     }
     
     printf("[TLS] Server context created (TLS 1.3)\n");
-
-    /* Install SIGCHLD handler */
-    sa.sa_handler = sigchld_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        perror("sigaction");
-        tls_free_ctx(tls_ctx);
-        return 1;
-    }
 
     /* Create socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -133,23 +131,27 @@ int main(int argc, char *argv[]) {
                inet_ntoa(client_addr.sin_addr), 
                ntohs(client_addr.sin_port));
 
-        /* Fork child process to handle client */
-        child_pid = fork();
-        
-        if (child_pid < 0) {
-            perror("fork");
+        ClientThreadArgs *thread_args = malloc(sizeof(*thread_args));
+        if (!thread_args) {
+            perror("malloc");
             socket_close(client_fd);
             continue;
-        } else if (child_pid == 0) {
-            /* Child process */
-            socket_close(server_fd);  /* Child doesn't need the listening socket */
-            handle_client(client_fd, tls_ctx, &engine, &metrics);
-            /* This point should not be reached (child calls exit) */
-            exit(0);
-        } else {
-            /* Parent process */
-            socket_close(client_fd);  /* Parent doesn't need the client socket */
         }
+
+        thread_args->connfd = client_fd;
+        thread_args->tls_ctx = tls_ctx;
+        thread_args->engine = &engine;
+        thread_args->metrics = &metrics;
+
+        pthread_t client_thread;
+        if (pthread_create(&client_thread, NULL, client_thread_main, thread_args) != 0) {
+            perror("pthread_create");
+            free(thread_args);
+            socket_close(client_fd);
+            continue;
+        }
+
+        pthread_detach(client_thread);
     }
 
     socket_close(server_fd);
