@@ -9,6 +9,7 @@ ifeq ($(OS),Windows_NT)
     MKDIR := mkdir
     PATHSEP := \\
     EXE_EXT := .exe
+	NULL_REDIRECT := nul
     # Windows-specific flags
     LDFLAGS_PLATFORM := -lws2_32
     CFLAGS_PLATFORM := 
@@ -19,6 +20,7 @@ else
     MKDIR := mkdir -p
     PATHSEP := /
     EXE_EXT :=
+	NULL_REDIRECT := /dev/null
     # Unix-specific flags
     LDFLAGS_PLATFORM :=
     CFLAGS_PLATFORM :=
@@ -28,11 +30,11 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -g \
           -I./include \
           $(CFLAGS_PLATFORM) \
-          $(shell pkg-config --cflags openssl 2>nul || echo -I/usr/include)
-LDFLAGS = $(shell pkg-config --libs openssl 2>nul || echo -lssl -lcrypto) \
+		  $(shell pkg-config --cflags openssl 2>$(NULL_REDIRECT) || echo -I/usr/include)
+LDFLAGS = $(shell pkg-config --libs openssl 2>$(NULL_REDIRECT) || echo -lssl -lcrypto) \
           -lpthread $(LDFLAGS_PLATFORM)
-GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>nul)
-GTK_LDFLAGS = $(shell pkg-config --libs gtk+-3.0 2>nul)
+GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>$(NULL_REDIRECT))
+GTK_LDFLAGS = $(shell pkg-config --libs gtk+-3.0 2>$(NULL_REDIRECT))
 
 # Source file groups
 SRC_COMMON = src/crypto/rsa_utils.c src/crypto/aes_utils.c \
@@ -103,11 +105,19 @@ client: bin bin/client
 bin/client: $(OBJ_CLIENT) $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-src/client/client_gui.o: src/client/client.c
+src/client/client_gui.o: src/client/client.c gtk-deps-check
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) -DCLIENT_NO_MAIN -c $< -o $@
 
-src/client/gtk_client.o: src/client/gtk_client.c
+src/client/gtk_client.o: src/client/gtk_client.c gtk-deps-check
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c $< -o $@
+
+.PHONY: gtk-deps-check
+gtk-deps-check:
+	@pkg-config --exists gtk+-3.0 || { \
+		echo "GTK+ 3 development headers are missing."; \
+		echo "Install them with: sudo apt-get install -y libgtk-3-dev pkg-config"; \
+		exit 1; \
+	}
 
 bin/client_gtk: $(OBJ_GTK_CLIENT) $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GTK_LDFLAGS)
@@ -152,7 +162,7 @@ clean-all: clean
 # Install dependencies (for Ubuntu/Debian)
 install-deps:
 	sudo apt-get update
-	sudo apt-get install -y gcc make libssl-dev pkg-config
+	sudo apt-get install -y gcc make libssl-dev pkg-config libgtk-3-dev
 
 # Run tests
 test: tests
