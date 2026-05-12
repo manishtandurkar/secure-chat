@@ -37,6 +37,7 @@ int main(int argc, char *argv[]) {
     SSL_CTX *tls_ctx = NULL;
     EngineState engine;
     Metrics metrics = {0};
+    AdaptiveMode prev_engine_mode = MODE_NORMAL;
 
     (void)argc; /* Unused parameter */
     (void)argv; /* Unused parameter */
@@ -111,9 +112,14 @@ int main(int argc, char *argv[]) {
     while (1) {
         /* Periodically expire IDS blocks */
         ids_expire_blocks();
-        
-        /* Evaluate adaptive engine state */
+
+        /* Evaluate adaptive engine state and broadcast on mode change */
         engine_evaluate(&engine, &metrics);
+        AdaptiveMode cur_mode = engine_get_mode(&engine);
+        if (cur_mode != prev_engine_mode) {
+            broadcast_engine_state(cur_mode);
+            prev_engine_mode = cur_mode;
+        }
         
         client_addr_len = sizeof(client_addr);
         client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);

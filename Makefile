@@ -120,7 +120,7 @@ certs:
 	cp certs/server.crt certs/ca.crt
 
 # Build tests
-tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath
+tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath bin/test_tls
 
 bin/test_ratchet: tests/test_ratchet.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -132,6 +132,9 @@ bin/test_adaptive: tests/test_adaptive.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 bin/test_multipath: tests/test_multipath.c $(OBJ_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bin/test_tls: tests/test_tls.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Generic rule for object files
@@ -161,6 +164,7 @@ test: tests
 	./bin/test_crypto
 	./bin/test_adaptive
 	./bin/test_multipath
+	./bin/test_tls
 	@echo "\n=== All Tests Complete ===\n"
 
 # Debug build

@@ -49,6 +49,12 @@ int auth_verify_login(const char *username, const unsigned char *data,
                       size_t data_len, const unsigned char *signature,
                       size_t sig_len);
 
+/**
+ * Broadcast current engine mode to all connected clients via MSG_ENGINE_STATE.
+ * Called from server main loop when engine transitions between modes.
+ */
+void broadcast_engine_state(AdaptiveMode new_mode);
+
 /* Room manager functions */
 
 /**

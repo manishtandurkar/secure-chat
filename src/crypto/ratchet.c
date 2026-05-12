@@ -179,79 +179,104 @@ int ratchet_dh_step(RatchetState *state, EVP_PKEY *peer_new_pubkey) {
     return SUCCESS;
 }
 
-/* Serialize ratchet state (simplified - would need proper key serialization) */
+/*
+ * Serialized format (174 bytes):
+ *   root_key[32] | send_chain_key[32] | recv_chain_key[32]
+ *   send_counter[4] | recv_counter[4] | prev_send_counter[4]
+ *   has_dh_privkey[1] | dh_privkey[32]
+ *   has_peer_pubkey[1] | peer_pubkey[32]
+ */
+#define RATCHET_SERIAL_SIZE (RATCHET_KEY_LEN * 3 + sizeof(uint32_t) * 3 + 1 + 32 + 1 + 32)
+
 int ratchet_serialize(const RatchetState *state, uint8_t *buf, size_t buf_len) {
-    if (!state || !buf) {
+    if (!state || !buf || buf_len < RATCHET_SERIAL_SIZE) {
         return -1;
     }
-    
-    /* For simplicity, serialize keys only (not EVP_PKEY structures)
-       In production, would need to serialize DH keys properly */
+
     size_t offset = 0;
-    size_t required = RATCHET_KEY_LEN * 3 + sizeof(uint32_t) * 3;
-    
-    if (buf_len < required) {
-        return -1;
+
+    memcpy(buf + offset, state->root_key, RATCHET_KEY_LEN);       offset += RATCHET_KEY_LEN;
+    memcpy(buf + offset, state->send_chain_key, RATCHET_KEY_LEN); offset += RATCHET_KEY_LEN;
+    memcpy(buf + offset, state->recv_chain_key, RATCHET_KEY_LEN); offset += RATCHET_KEY_LEN;
+
+    memcpy(buf + offset, &state->send_counter, sizeof(uint32_t));      offset += sizeof(uint32_t);
+    memcpy(buf + offset, &state->recv_counter, sizeof(uint32_t));      offset += sizeof(uint32_t);
+    memcpy(buf + offset, &state->prev_send_counter, sizeof(uint32_t)); offset += sizeof(uint32_t);
+
+    /* DH private key (X25519 raw 32 bytes) */
+    if (state->dh_keypair) {
+        uint8_t privkey[32];
+        size_t privkey_len = sizeof(privkey);
+        if (EVP_PKEY_get_raw_private_key(state->dh_keypair, privkey, &privkey_len) == 1 &&
+            privkey_len == 32) {
+            buf[offset++] = 1;
+            memcpy(buf + offset, privkey, 32);
+            OPENSSL_cleanse(privkey, sizeof(privkey));
+        } else {
+            buf[offset++] = 0;
+            memset(buf + offset, 0, 32);
+        }
+    } else {
+        buf[offset++] = 0;
+        memset(buf + offset, 0, 32);
     }
-    
-    memcpy(buf + offset, state->root_key, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(buf + offset, state->send_chain_key, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(buf + offset, state->recv_chain_key, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(buf + offset, &state->send_counter, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    memcpy(buf + offset, &state->recv_counter, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    memcpy(buf + offset, &state->prev_send_counter, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
+    offset += 32;
+
+    /* Peer DH public key (X25519 raw 32 bytes) */
+    if (state->peer_dh_pubkey) {
+        uint8_t pubkey[32];
+        size_t pubkey_len = sizeof(pubkey);
+        if (EVP_PKEY_get_raw_public_key(state->peer_dh_pubkey, pubkey, &pubkey_len) == 1 &&
+            pubkey_len == 32) {
+            buf[offset++] = 1;
+            memcpy(buf + offset, pubkey, 32);
+        } else {
+            buf[offset++] = 0;
+            memset(buf + offset, 0, 32);
+        }
+    } else {
+        buf[offset++] = 0;
+        memset(buf + offset, 0, 32);
+    }
+    offset += 32;
+
     return (int)offset;
 }
 
 /* Deserialize ratchet state */
 int ratchet_deserialize(RatchetState *state, const uint8_t *buf, size_t buf_len) {
-    if (!state || !buf) {
+    if (!state || !buf || buf_len < RATCHET_SERIAL_SIZE) {
         return -1;
     }
-    
-    size_t offset = 0;
-    size_t required = RATCHET_KEY_LEN * 3 + sizeof(uint32_t) * 3;
-    
-    if (buf_len < required) {
-        return -1;
-    }
-    
+
     memset(state, 0, sizeof(RatchetState));
-    
-    memcpy(state->root_key, buf + offset, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(state->send_chain_key, buf + offset, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(state->recv_chain_key, buf + offset, RATCHET_KEY_LEN);
-    offset += RATCHET_KEY_LEN;
-    
-    memcpy(&state->send_counter, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    memcpy(&state->recv_counter, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    memcpy(&state->prev_send_counter, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Note: DH keys would need to be regenerated or separately serialized */
-    state->dh_keypair = NULL;
-    state->peer_dh_pubkey = NULL;
-    
+    size_t offset = 0;
+
+    memcpy(state->root_key, buf + offset, RATCHET_KEY_LEN);       offset += RATCHET_KEY_LEN;
+    memcpy(state->send_chain_key, buf + offset, RATCHET_KEY_LEN); offset += RATCHET_KEY_LEN;
+    memcpy(state->recv_chain_key, buf + offset, RATCHET_KEY_LEN); offset += RATCHET_KEY_LEN;
+
+    memcpy(&state->send_counter, buf + offset, sizeof(uint32_t));      offset += sizeof(uint32_t);
+    memcpy(&state->recv_counter, buf + offset, sizeof(uint32_t));      offset += sizeof(uint32_t);
+    memcpy(&state->prev_send_counter, buf + offset, sizeof(uint32_t)); offset += sizeof(uint32_t);
+
+    /* DH private key */
+    uint8_t has_dh = buf[offset++];
+    if (has_dh) {
+        state->dh_keypair = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
+                                                          buf + offset, 32);
+    }
+    offset += 32;
+
+    /* Peer DH public key */
+    uint8_t has_peer = buf[offset++];
+    if (has_peer) {
+        state->peer_dh_pubkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
+                                                              buf + offset, 32);
+    }
+    offset += 32;
+
+    (void)offset;
     return SUCCESS;
 }
 

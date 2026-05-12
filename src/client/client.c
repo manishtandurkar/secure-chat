@@ -8,6 +8,8 @@
 #include "client.h"
 #include "crypto.h"
 #include "message.h"
+#include "ratchet.h"
+#include "adaptive_engine.h"
 #include "priority_queue.h"
 #include "socket_utils.h"
 #include "dns_resolver.h"
@@ -18,10 +20,12 @@
 #include <stdarg.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 
 #ifndef PLATFORM_WINDOWS
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
 #endif
 
 /* Global client state for signal handlers */
@@ -158,6 +162,9 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
     /* Initialize dedup set */
     memset(client->dedup_set, 0, sizeof(client->dedup_set));
     client->dedup_idx = 0;
+
+    /* Default DH ratchet frequency (updated by MSG_ENGINE_STATE) */
+    client->dh_ratchet_freq = 10;
 
     return 0;
 }
@@ -332,6 +339,49 @@ int authenticate_with_server(ClientState *client) {
     }
 }
 
+/* Send MSG_RATCHET_DH if send_counter has hit the DH ratchet frequency threshold.
+   Called after every successful message send. */
+static void trigger_dh_ratchet_if_needed(ClientState *client) {
+    pthread_mutex_lock(&client->ratchet_lock);
+    uint32_t send_count = client->ratchet.send_counter;
+    pthread_mutex_unlock(&client->ratchet_lock);
+
+    if (send_count == 0 || (send_count % (uint32_t)client->dh_ratchet_freq) != 0) {
+        return;
+    }
+
+    EVP_PKEY *new_keypair = dh_generate_keypair();
+    if (!new_keypair) {
+        return;
+    }
+
+    uint8_t new_pubkey[DH_PUBKEY_LEN];
+    size_t pubkey_len = DH_PUBKEY_LEN;
+    if (dh_get_public_key(new_keypair, new_pubkey, &pubkey_len) != 0) {
+        EVP_PKEY_free(new_keypair);
+        return;
+    }
+
+    pthread_mutex_lock(&client->ratchet_lock);
+    if (client->ratchet.dh_keypair) {
+        EVP_PKEY_free(client->ratchet.dh_keypair);
+    }
+    client->ratchet.dh_keypair = new_keypair;
+    pthread_mutex_unlock(&client->ratchet_lock);
+
+    MsgHeader hdr = {0};
+    hdr.version = MSG_VERSION;
+    hdr.msg_type = MSG_RATCHET_DH;
+    hdr.priority = PRIORITY_NORMAL;
+    RAND_bytes(hdr.msg_id, MSG_ID_LEN);
+    hdr.payload_len = htonl(DH_PUBKEY_LEN);
+
+    tls_send(client->ssl, &hdr, sizeof(hdr));
+    tls_send(client->ssl, new_pubkey, DH_PUBKEY_LEN);
+
+    client_log_line("[+] DH ratchet key refreshed");
+}
+
 /* Receive thread: reads from TLS, decrypts via ratchet, displays */
 void *recv_thread_func(void *arg) {
     ClientState *client = (ClientState *)arg;
@@ -468,6 +518,44 @@ void *recv_thread_func(void *arg) {
             } else {
                 client_log_line("[USERS]");
             }
+        } else if (hdr.msg_type == MSG_RATCHET_DH) {
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len != DH_PUBKEY_LEN) {
+                uint8_t *discard = malloc(payload_len);
+                if (discard) { tls_recv(client->ssl, discard, payload_len); free(discard); }
+                continue;
+            }
+            uint8_t peer_pubkey_bytes[DH_PUBKEY_LEN];
+            if (tls_recv(client->ssl, peer_pubkey_bytes, DH_PUBKEY_LEN) != DH_PUBKEY_LEN) {
+                continue;
+            }
+            EVP_PKEY *peer_new_pubkey = dh_pubkey_from_bytes(peer_pubkey_bytes, DH_PUBKEY_LEN);
+            if (!peer_new_pubkey) {
+                continue;
+            }
+            pthread_mutex_lock(&client->ratchet_lock);
+            ratchet_dh_step(&client->ratchet, peer_new_pubkey);
+            pthread_mutex_unlock(&client->ratchet_lock);
+            EVP_PKEY_free(peer_new_pubkey);
+            client_log_line("[+] DH ratchet step: forward secrecy renewed");
+
+        } else if (hdr.msg_type == MSG_ENGINE_STATE) {
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len == 1) {
+                uint8_t mode_byte = 0;
+                if (tls_recv(client->ssl, &mode_byte, 1) == 1) {
+                    /* Adjust DH ratchet frequency based on engine mode */
+                    client->dh_ratchet_freq = (mode_byte == MODE_HIGH_RISK) ? 1 : 10;
+                    const char *mode_str = (mode_byte == 0) ? "NORMAL"
+                                        : (mode_byte == 1) ? "UNSTABLE"
+                                        : "HIGH_RISK";
+                    client_log_format("[Engine] Mode -> %s (DH ratchet every %d msgs)",
+                                      mode_str, client->dh_ratchet_freq);
+                }
+            } else {
+                uint8_t *discard = malloc(payload_len);
+                if (discard) { tls_recv(client->ssl, discard, payload_len); free(discard); }
+            }
         } else {
             /* Skip unknown message types */
             uint32_t payload_len = ntohl(hdr.payload_len);
@@ -601,6 +689,8 @@ void *send_thread_func(void *arg) {
             break;
         }
 
+        trigger_dh_ratchet_if_needed(client);
+
         if (!g_log_callback) {
             printf("> ");
             fflush(stdout);
@@ -674,34 +764,127 @@ void client_cleanup(ClientState *client) {
         EVP_PKEY_free(client->rsa_keypair);
         client->rsa_keypair = NULL;
     }
-    
+
+    save_ratchet_state(client);
     ratchet_destroy(&client->ratchet);
     pthread_mutex_destroy(&client->ratchet_lock);
 }
 
-/* Save ratchet state to encrypted file */
-int save_ratchet_state(ClientState *client) {
-    /* TODO: Implement ratchet state persistence
-     * 1. Serialize ratchet state using ratchet_serialize()
-     * 2. Encrypt serialized state with passphrase-derived key
-     * 3. Write to ~/.aschat/<username>.ratchet with 0600 permissions
-     */
-    (void)client;
-    fprintf(stderr, "[WARN] save_ratchet_state not yet implemented\n");
-    return 0; /* Non-fatal for now */
+/*
+ * Ratchet persistence format written to ~/.aschat/<username>.ratchet:
+ *   salt[16] | iv[16] | AES-256-CBC(key, iv, ratchet_serialized)
+ * key = PBKDF2-HMAC-SHA256(password=username, salt, iterations=10000, dklen=32)
+ */
+
+#ifndef PLATFORM_WINDOWS
+
+static int aschat_get_state_path(const ClientState *client, char *path_out, size_t path_len) {
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.aschat", home);
+    /* mkdir is idempotent; ignore EEXIST */
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    snprintf(path_out, path_len, "%s/.aschat/%s.ratchet", home, client->username);
+    return 0;
 }
 
-/* Load ratchet state from encrypted file */
-int load_ratchet_state(ClientState *client) {
-    /* TODO: Implement ratchet state recovery
-     * 1. Read from ~/.aschat/<username>.ratchet
-     * 2. Decrypt using passphrase-derived key
-     * 3. Deserialize using ratchet_deserialize()
-     * Returns 0 on success, -1 if file doesn't exist (first run)
-     */
-    (void)client;
-    return -1; /* Indicates no saved state exists */
+int save_ratchet_state(ClientState *client) {
+    if (!client) return -1;
+
+    uint8_t serial[256];
+    pthread_mutex_lock(&client->ratchet_lock);
+    int serial_len = ratchet_serialize(&client->ratchet, serial, sizeof(serial));
+    pthread_mutex_unlock(&client->ratchet_lock);
+    if (serial_len < 0) return -1;
+
+    uint8_t salt[16], iv[AES_IV_LEN];
+    RAND_bytes(salt, sizeof(salt));
+    RAND_bytes(iv, sizeof(iv));
+
+    uint8_t enc_key[32];
+    if (PKCS5_PBKDF2_HMAC(client->username, (int)strlen(client->username),
+                           salt, sizeof(salt), 10000,
+                           EVP_sha256(), 32, enc_key) != 1) {
+        OPENSSL_cleanse(serial, sizeof(serial));
+        return -1;
+    }
+
+    uint8_t ciphertext[512];
+    int ct_len = aes_encrypt(enc_key, iv, serial, serial_len, ciphertext);
+    OPENSSL_cleanse(enc_key, sizeof(enc_key));
+    OPENSSL_cleanse(serial, sizeof(serial));
+    if (ct_len < 0) return -1;
+
+    char path[512];
+    if (aschat_get_state_path(client, path, sizeof(path)) != 0) return -1;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+
+    ssize_t written = write(fd, salt, sizeof(salt));
+    written += write(fd, iv, sizeof(iv));
+    written += write(fd, ciphertext, (size_t)ct_len);
+    close(fd);
+
+    return (written == (ssize_t)(sizeof(salt) + sizeof(iv) + (size_t)ct_len)) ? 0 : -1;
 }
+
+int load_ratchet_state(ClientState *client) {
+    if (!client) return -1;
+
+    char path[512];
+    if (aschat_get_state_path(client, path, sizeof(path)) != 0) return -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    uint8_t salt[16], iv[AES_IV_LEN];
+    if (read(fd, salt, sizeof(salt)) != (ssize_t)sizeof(salt) ||
+        read(fd, iv, sizeof(iv)) != (ssize_t)sizeof(iv)) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t ciphertext[512];
+    ssize_t ct_len = read(fd, ciphertext, sizeof(ciphertext));
+    close(fd);
+    if (ct_len <= 0) return -1;
+
+    uint8_t enc_key[32];
+    if (PKCS5_PBKDF2_HMAC(client->username, (int)strlen(client->username),
+                           salt, sizeof(salt), 10000,
+                           EVP_sha256(), 32, enc_key) != 1) {
+        return -1;
+    }
+
+    uint8_t plaintext[512];
+    int pt_len = aes_decrypt(enc_key, iv, ciphertext, (int)ct_len, plaintext);
+    OPENSSL_cleanse(enc_key, sizeof(enc_key));
+    if (pt_len < 0) return -1;
+
+    pthread_mutex_lock(&client->ratchet_lock);
+    int ret = ratchet_deserialize(&client->ratchet, plaintext, (size_t)pt_len);
+    pthread_mutex_unlock(&client->ratchet_lock);
+    OPENSSL_cleanse(plaintext, sizeof(plaintext));
+    return ret;
+}
+
+#else /* PLATFORM_WINDOWS */
+
+int save_ratchet_state(ClientState *client) {
+    (void)client;
+    return 0; /* Not implemented for Windows */
+}
+
+int load_ratchet_state(ClientState *client) {
+    (void)client;
+    return -1;
+}
+
+#endif /* PLATFORM_WINDOWS */
 
 /* Main client entry point */
 int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority) {
@@ -773,6 +956,8 @@ int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint
         client->running = 0;
         return -1;
     }
+
+    trigger_dh_ratchet_if_needed(client);
 
     return 0;
 }
