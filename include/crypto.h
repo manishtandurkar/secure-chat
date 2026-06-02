@@ -6,59 +6,60 @@
 /* Forward declaration for OpenSSL types */
 typedef struct evp_pkey_st EVP_PKEY;
 
-/* RSA utilities */
+/* Ed25519 utilities */
 
 /**
- * Generate a new RSA-2048 keypair. Returns EVP_PKEY* or NULL on error.
+ * Generate a new Ed25519 keypair. Returns EVP_PKEY* or NULL on error.
  */
-EVP_PKEY *rsa_generate_keypair(void);
+EVP_PKEY *ed25519_generate_keypair(void);
 
 /**
  * Serialize public key to PEM format into buf (max buf_len bytes).
  * Returns number of bytes written, or -1 on error.
  */
-int rsa_pubkey_to_pem(EVP_PKEY *key, char *buf, size_t buf_len);
+int ed25519_pubkey_to_pem(EVP_PKEY *key, char *buf, size_t buf_len);
 
 /**
  * Load a public key from PEM buffer. Returns EVP_PKEY* or NULL.
  */
-EVP_PKEY *rsa_pubkey_from_pem(const char *pem_buf, size_t pem_len);
+EVP_PKEY *ed25519_pubkey_from_pem(const char *pem_buf, size_t pem_len);
 
 /**
  * Sign data using private key. Signature written to sig_buf.
  * sig_len set to actual signature length. Returns 0 on success.
  */
-int rsa_sign(EVP_PKEY *privkey, const unsigned char *data, size_t data_len,
-             unsigned char *sig_buf, size_t *sig_len);
+int ed25519_sign(EVP_PKEY *privkey, const unsigned char *data, size_t data_len,
+                 unsigned char *sig_buf, size_t *sig_len);
 
 /**
- * Verify signature. Returns 1 if valid, 0 if invalid, -1 on error.
+ * Verify signature. Returns 0 if valid, non-zero on error/invalid.
  */
-int rsa_verify(EVP_PKEY *pubkey, const unsigned char *data, size_t data_len,
-               const unsigned char *sig, size_t sig_len);
+int ed25519_verify(EVP_PKEY *pubkey, const unsigned char *data, size_t data_len,
+                   const unsigned char *sig, size_t sig_len);
 
-/* AES utilities */
+/* AES utilities (AES-256-GCM) */
 
 /**
- * Encrypt plaintext using AES-256-CBC.
- * key must be 32 bytes. iv must be 16 bytes (randomly generated per message).
- * ciphertext_buf must be at least plaintext_len + AES_BLOCK_SIZE bytes.
+ * Encrypt plaintext using AES-256-GCM.
+ * key must be 32 bytes. iv must be 12 bytes (randomly generated per message).
+ * ciphertext_buf must be at least plaintext_len bytes.
+ * tag_out must be 16 bytes.
  * Returns ciphertext length or -1 on error.
  */
 int aes_encrypt(const unsigned char *key, const unsigned char *iv,
                 const unsigned char *plaintext, int plaintext_len,
-                unsigned char *ciphertext_buf);
+                unsigned char *ciphertext_buf, unsigned char *tag_out);
 
 /**
- * Decrypt ciphertext using AES-256-CBC.
+ * Decrypt ciphertext using AES-256-GCM.
  * Returns plaintext length or -1 on error.
  */
 int aes_decrypt(const unsigned char *key, const unsigned char *iv,
                 const unsigned char *ciphertext, int ciphertext_len,
-                unsigned char *plaintext_buf);
+                const unsigned char *tag, unsigned char *plaintext_buf);
 
 /**
- * Generate cryptographically secure random IV (16 bytes).
+ * Generate cryptographically secure random IV (12 bytes for GCM).
  * Returns 0 on success, -1 on failure.
  */
 int aes_generate_iv(unsigned char *iv_buf);

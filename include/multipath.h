@@ -1,10 +1,10 @@
 #ifndef MULTIPATH_H
 #define MULTIPATH_H
 
+#include "platform_compat.h"
 #include "common.h"
 #include "adaptive_engine.h"
 #include <openssl/ssl.h>
-#include <netinet/in.h>
 
 /**
  * Send msg over both TCP (ssl) and UDP (udp_fd) simultaneously.

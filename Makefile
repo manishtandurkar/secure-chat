@@ -37,11 +37,12 @@ GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>$(NULL_REDIRECT))
 GTK_LDFLAGS = $(shell pkg-config --libs gtk+-3.0 2>$(NULL_REDIRECT))
 
 # Source file groups
-SRC_COMMON = src/crypto/rsa_utils.c src/crypto/aes_utils.c \
+SRC_COMMON = src/crypto/ed25519_utils.c src/crypto/prekey.c src/crypto/aes_utils.c \
              src/crypto/dh_exchange.c src/crypto/crypto_common.c \
              src/crypto/ratchet.c \
              src/tls/tls_server.c src/tls/tls_client.c \
              src/engine/adaptive_engine.c src/engine/metrics_collector.c \
+             src/engine/network_monitor.c \
              src/transport/multipath.c src/transport/offline_queue.c \
              src/transport/priority_queue.c \
              src/security/intrusion.c \
@@ -130,7 +131,7 @@ certs:
 	cp certs/server.crt certs/ca.crt
 
 # Build tests
-tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath bin/test_tls
+tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath bin/test_tls bin/test_ids bin/test_network_monitor
 
 bin/test_ratchet: tests/test_ratchet.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -145,6 +146,12 @@ bin/test_multipath: tests/test_multipath.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 bin/test_tls: tests/test_tls.c $(OBJ_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bin/test_ids: tests/test_ids.c $(OBJ_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bin/test_network_monitor: tests/test_network_monitor.c $(OBJ_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Generic rule for object files
@@ -169,13 +176,15 @@ install-deps:
 
 # Run tests
 test: tests
-	@echo "\n=== Running Test Suite ===\n"
+	@echo "\n=== Running Test Suite ==="
 	./bin/test_ratchet
 	./bin/test_crypto
 	./bin/test_adaptive
 	./bin/test_multipath
 	./bin/test_tls
-	@echo "\n=== All Tests Complete ===\n"
+	./bin/test_ids
+	./bin/test_network_monitor
+	@echo "\n=== All Tests Complete ==="
 
 # Debug build
 debug: CFLAGS += -DDEBUG -O0

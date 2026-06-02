@@ -4,25 +4,26 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
-/* Generate random 16-byte IV for AES */
+/* Generate random 12-byte IV for AES-GCM */
 int aes_generate_iv(unsigned char *iv_buf) {
     if (!iv_buf) {
         return ERROR_CRYPTO;
     }
     
-    if (RAND_bytes(iv_buf, AES_IV_LEN) != 1) {
+    if (RAND_bytes(iv_buf, 12) != 1) {
         return ERROR_CRYPTO;
     }
     
     return SUCCESS;
 }
 
-/* AES-256-CBC encryption */
+/* AES-256-GCM encryption */
 int aes_encrypt(const unsigned char *key,
                 const unsigned char *iv,
                 const unsigned char *plaintext, int plaintext_len,
-                unsigned char *ciphertext_buf) {
-    if (!key || !iv || !plaintext || !ciphertext_buf) {
+                unsigned char *ciphertext_buf,
+                unsigned char *tag_out) {
+    if (!key || !iv || !plaintext || !ciphertext_buf || !tag_out) {
         return ERROR_CRYPTO;
     }
     
@@ -35,8 +36,18 @@ int aes_encrypt(const unsigned char *key,
     int ciphertext_len = 0;
     int ret = ERROR_CRYPTO;
     
-    /* Initialize encryption */
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+    /* Initialize encryption with GCM */
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
+        goto cleanup;
+    }
+    
+    /* Set IV length to 12 bytes */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) {
+        goto cleanup;
+    }
+    
+    /* Set key and IV */
+    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) {
         goto cleanup;
     }
     
@@ -46,11 +57,16 @@ int aes_encrypt(const unsigned char *key,
     }
     ciphertext_len = len;
     
-    /* Finalize encryption (adds padding if needed) */
+    /* Finalize encryption (no padding is added for GCM, but call is required) */
     if (EVP_EncryptFinal_ex(ctx, ciphertext_buf + len, &len) != 1) {
         goto cleanup;
     }
     ciphertext_len += len;
+    
+    /* Get GCM tag (16 bytes) */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag_out) != 1) {
+        goto cleanup;
+    }
     
     ret = ciphertext_len;
     
@@ -59,12 +75,13 @@ cleanup:
     return ret;
 }
 
-/* AES-256-CBC decryption */
+/* AES-256-GCM decryption */
 int aes_decrypt(const unsigned char *key,
                 const unsigned char *iv,
                 const unsigned char *ciphertext, int ciphertext_len,
+                const unsigned char *tag,
                 unsigned char *plaintext_buf) {
-    if (!key || !iv || !ciphertext || !plaintext_buf) {
+    if (!key || !iv || !ciphertext || !tag || !plaintext_buf) {
         return ERROR_CRYPTO;
     }
     
@@ -77,8 +94,18 @@ int aes_decrypt(const unsigned char *key,
     int plaintext_len = 0;
     int ret = ERROR_CRYPTO;
     
-    /* Initialize decryption */
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+    /* Initialize decryption with GCM */
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
+        goto cleanup;
+    }
+    
+    /* Set IV length to 12 bytes */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) {
+        goto cleanup;
+    }
+    
+    /* Set key and IV */
+    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) {
         goto cleanup;
     }
     
@@ -88,13 +115,18 @@ int aes_decrypt(const unsigned char *key,
     }
     plaintext_len = len;
     
-    /* Finalize decryption (removes padding) */
-    if (EVP_DecryptFinal_ex(ctx, plaintext_buf + len, &len) != 1) {
+    /* Set expected GCM tag */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) != 1) {
         goto cleanup;
     }
-    plaintext_len += len;
     
-    ret = plaintext_len;
+    /* Finalize decryption and verify tag */
+    if (EVP_DecryptFinal_ex(ctx, plaintext_buf + len, &len) > 0) {
+        plaintext_len += len;
+        ret = plaintext_len;
+    } else {
+        ret = ERROR_CRYPTO; /* Decryption or tag verification failed */
+    }
     
 cleanup:
     EVP_CIPHER_CTX_free(ctx);

@@ -42,6 +42,11 @@ int main(int argc, char *argv[]) {
     (void)argc; /* Unused parameter */
     (void)argv; /* Unused parameter */
 
+    if (platform_socket_init() != 0) {
+        fprintf(stderr, "Failed to initialize socket platform\n");
+        return 1;
+    }
+
     printf("Starting Adaptive Secure Communication System\n");
     printf("Protocol Version: 0x%02x\n", PROTOCOL_VERSION);
     printf("Features: Double Ratchet | Multi-Path | Adaptive Engine | Offline Queue\n\n");
@@ -162,6 +167,7 @@ int main(int argc, char *argv[]) {
 
     socket_close(server_fd);
     tls_free_ctx(tls_ctx);
+    platform_socket_cleanup();
     return 0;
 }
 

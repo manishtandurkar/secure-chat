@@ -1,7 +1,7 @@
 #include "platform_compat.h"
 #include "server.h"
 #include "crypto.h"
-#include "ratchet.h"
+#include "prekey.h"
 #include "message.h"
 #include "tls_layer.h"
 #include "adaptive_engine.h"
@@ -11,33 +11,34 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_DIRECTED_MSG_LEN (MAX_MSG_LEN - MAX_USERNAME_LEN - 4)
-
 typedef struct {
     int active;
     char username[MAX_USERNAME_LEN];
     SSL *ssl;
-    RatchetState *ratchet;
-    pthread_mutex_t *ratchet_lock;
     pthread_mutex_t send_lock;
 } ConnectedClient;
 
 static ConnectedClient g_connected[MAX_CLIENTS];
 static pthread_mutex_t g_connected_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Static cache for Client PreKey Bundles */
+static struct {
+    char username[MAX_USERNAME_LEN];
+    PreKeyBundle bundle;
+    int has_bundle;
+} g_client_prekeys[MAX_CLIENTS];
+static pthread_mutex_t g_prekeys_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void build_online_user_list(char *out, size_t out_len, const char *exclude_username) {
     out[0] = '\0';
-
     pthread_mutex_lock(&g_connected_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!g_connected[i].active) {
             continue;
         }
-
         if (exclude_username && strcmp(g_connected[i].username, exclude_username) == 0) {
             continue;
         }
-
         if (out[0] != '\0') {
             strncat(out, ",", out_len - strlen(out) - 1);
         }
@@ -62,36 +63,40 @@ static void send_control_message(SSL *ssl, uint8_t msg_type, const uint8_t *payl
     }
 }
 
-static void register_connected_client(const char *username,
-                                      SSL *ssl,
-                                      RatchetState *ratchet,
-                                      pthread_mutex_t *ratchet_lock) {
+static void register_connected_client(const char *username, SSL *ssl) {
     pthread_mutex_lock(&g_connected_lock);
-
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (g_connected[i].active && strcmp(g_connected[i].username, username) == 0) {
             g_connected[i].ssl = ssl;
-            g_connected[i].ratchet = ratchet;
-            g_connected[i].ratchet_lock = ratchet_lock;
             pthread_mutex_unlock(&g_connected_lock);
             return;
         }
     }
-
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!g_connected[i].active) {
             g_connected[i].active = 1;
             strncpy(g_connected[i].username, username, MAX_USERNAME_LEN - 1);
             g_connected[i].username[MAX_USERNAME_LEN - 1] = '\0';
             g_connected[i].ssl = ssl;
-            g_connected[i].ratchet = ratchet;
-            g_connected[i].ratchet_lock = ratchet_lock;
             pthread_mutex_init(&g_connected[i].send_lock, NULL);
             pthread_mutex_unlock(&g_connected_lock);
             return;
         }
     }
+    pthread_mutex_unlock(&g_connected_lock);
+}
 
+static void unregister_connected_client(const char *username) {
+    pthread_mutex_lock(&g_connected_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_connected[i].active && strcmp(g_connected[i].username, username) == 0) {
+            g_connected[i].active = 0;
+            g_connected[i].username[0] = '\0';
+            g_connected[i].ssl = NULL;
+            pthread_mutex_destroy(&g_connected[i].send_lock);
+            break;
+        }
+    }
     pthread_mutex_unlock(&g_connected_lock);
 }
 
@@ -106,222 +111,92 @@ void broadcast_engine_state(AdaptiveMode new_mode) {
     fprintf(stderr, "[Engine] Broadcast mode=%d to connected clients\n", (int)new_mode);
 }
 
-static void unregister_connected_client(const char *username) {
-    pthread_mutex_lock(&g_connected_lock);
+/* Offline delivery helper: relays ciphertext blindly */
+static int offline_delivery_callback(const void *payload, size_t len, void *ctx) {
+    SSL *ssl = (SSL *)ctx;
+    MsgHeader out_hdr = {0};
+    out_hdr.version = PROTOCOL_VERSION;
+    out_hdr.msg_type = MSG_CHAT;
+    out_hdr.priority = PRIORITY_NORMAL;
+    out_hdr.flags = 0x02; /* Indicate offline recovery */
+    out_hdr.payload_len = htonl((uint32_t)len);
+    generate_random_bytes(out_hdr.msg_id, MSG_ID_LEN);
 
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (g_connected[i].active && strcmp(g_connected[i].username, username) == 0) {
-            g_connected[i].active = 0;
-            g_connected[i].username[0] = '\0';
-            g_connected[i].ssl = NULL;
-            g_connected[i].ratchet = NULL;
-            g_connected[i].ratchet_lock = NULL;
-            pthread_mutex_destroy(&g_connected[i].send_lock);
-            break;
-        }
-    }
-
-    pthread_mutex_unlock(&g_connected_lock);
+    int ok = (tls_send(ssl, &out_hdr, sizeof(out_hdr)) == (int)sizeof(out_hdr) &&
+              tls_send(ssl, payload, (int)len) == (int)len);
+    return ok ? SUCCESS : ERROR_NETWORK;
 }
 
-static int parse_directed_message(const uint8_t *plaintext,
-                                  int plaintext_len,
-                                  char *recipient_out,
-                                  size_t recipient_len,
-                                  char *body_out,
-                                  size_t body_len) {
-    if (plaintext_len <= 0 || plaintext[0] != '@') {
-        return -1;
-    }
-
-    const char *text = (const char *)plaintext;
-    const char *space = strchr(text, ' ');
-    if (!space) {
-        return -1;
-    }
-
-    size_t user_len = (size_t)(space - (text + 1));
-    if (user_len == 0 || user_len >= recipient_len) {
-        return -1;
-    }
-
-    memcpy(recipient_out, text + 1, user_len);
-    recipient_out[user_len] = '\0';
-
-    const char *body = space + 1;
-    while (*body == ' ') {
-        body++;
-    }
-
-    if (*body == '\0') {
-        return -1;
-    }
-
-    strncpy(body_out, body, body_len - 1);
-    body_out[body_len - 1] = '\0';
-    return 0;
-}
-
+/* Blind routing of E2EE payload to active user or offline queue */
 static int route_directed_message(const char *sender,
                                   const char *recipient,
-                                  const char *body,
+                                  const E2EEChatPayload *payload,
                                   uint8_t priority,
                                   const uint8_t msg_id[MSG_ID_LEN]) {
-    char delivered_text[MAX_MSG_LEN];
-    snprintf(delivered_text, sizeof(delivered_text), "%s: %s", sender, body);
-
     pthread_mutex_lock(&g_connected_lock);
 
+    /* Broadcast blind relay to '@all' */
     if (strcmp(recipient, "all") == 0) {
         int delivered_count = 0;
-
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!g_connected[i].active || strcmp(g_connected[i].username, sender) == 0) {
                 continue;
             }
 
             ConnectedClient *target = &g_connected[i];
-
-            uint8_t padded[MSG_PADDED_SIZE];
-            if (msg_pad((const uint8_t *)delivered_text, strlen(delivered_text), padded) != SUCCESS) {
-                continue;
-            }
-
-            uint8_t iv[AES_IV_LEN];
-            if (aes_generate_iv(iv) != SUCCESS) {
-                continue;
-            }
-
-            uint8_t msg_key[RATCHET_KEY_LEN];
-            pthread_mutex_lock(target->ratchet_lock);
-            if (ratchet_send_step(target->ratchet, msg_key) != SUCCESS) {
-                pthread_mutex_unlock(target->ratchet_lock);
-                OPENSSL_cleanse(msg_key, sizeof(msg_key));
-                continue;
-            }
-            pthread_mutex_unlock(target->ratchet_lock);
-
-            uint8_t ciphertext[MSG_PADDED_SIZE + 64];
-            int ciphertext_len = aes_encrypt(msg_key, iv, padded, MSG_PADDED_SIZE, ciphertext);
-            OPENSSL_cleanse(msg_key, sizeof(msg_key));
-            if (ciphertext_len < 0) {
-                continue;
-            }
-
-            uint32_t payload_len = AES_IV_LEN + (uint32_t)ciphertext_len;
-            uint8_t *payload = malloc(payload_len);
-            if (!payload) {
-                continue;
-            }
-
-            memcpy(payload, iv, AES_IV_LEN);
-            memcpy(payload + AES_IV_LEN, ciphertext, (size_t)ciphertext_len);
-
             MsgHeader out_hdr = {0};
             out_hdr.version = PROTOCOL_VERSION;
             out_hdr.msg_type = MSG_CHAT;
             out_hdr.priority = priority;
             out_hdr.flags = 0;
-            out_hdr.payload_len = htonl(payload_len);
-            out_hdr.checksum = 0;
-            generate_random_bytes(out_hdr.msg_id, MSG_ID_LEN);
+            out_hdr.payload_len = htonl(sizeof(E2EEChatPayload));
+            memcpy(out_hdr.msg_id, msg_id, MSG_ID_LEN);
 
             pthread_mutex_lock(&target->send_lock);
             int ok = (tls_send(target->ssl, &out_hdr, sizeof(out_hdr)) == (int)sizeof(out_hdr) &&
-                      tls_send(target->ssl, payload, (int)payload_len) == (int)payload_len);
+                      tls_send(target->ssl, payload, sizeof(E2EEChatPayload)) == (int)sizeof(E2EEChatPayload));
             pthread_mutex_unlock(&target->send_lock);
 
-            free(payload);
-            if (ok) {
-                delivered_count++;
-            }
+            if (ok) delivered_count++;
         }
-
         pthread_mutex_unlock(&g_connected_lock);
         return delivered_count > 0 ? 0 : -1;
     }
 
+    /* Directed relay to specific online target */
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (g_connected[i].active && strcmp(g_connected[i].username, recipient) == 0) {
             ConnectedClient *target = &g_connected[i];
-
-            uint8_t padded[MSG_PADDED_SIZE];
-            if (msg_pad((const uint8_t *)delivered_text, strlen(delivered_text), padded) != SUCCESS) {
-                pthread_mutex_unlock(&g_connected_lock);
-                return -1;
-            }
-
-            uint8_t iv[AES_IV_LEN];
-            if (aes_generate_iv(iv) != SUCCESS) {
-                pthread_mutex_unlock(&g_connected_lock);
-                return -1;
-            }
-
-            uint8_t msg_key[RATCHET_KEY_LEN];
-            pthread_mutex_lock(target->ratchet_lock);
-            if (ratchet_send_step(target->ratchet, msg_key) != SUCCESS) {
-                pthread_mutex_unlock(target->ratchet_lock);
-                OPENSSL_cleanse(msg_key, sizeof(msg_key));
-                pthread_mutex_unlock(&g_connected_lock);
-                return -1;
-            }
-            pthread_mutex_unlock(target->ratchet_lock);
-
-            uint8_t ciphertext[MSG_PADDED_SIZE + 64];
-            int ciphertext_len = aes_encrypt(msg_key, iv, padded, MSG_PADDED_SIZE, ciphertext);
-            OPENSSL_cleanse(msg_key, sizeof(msg_key));
-
-            if (ciphertext_len < 0) {
-                pthread_mutex_unlock(&g_connected_lock);
-                return -1;
-            }
-
-            uint32_t payload_len = AES_IV_LEN + (uint32_t)ciphertext_len;
-            uint8_t *payload = malloc(payload_len);
-            if (!payload) {
-                pthread_mutex_unlock(&g_connected_lock);
-                return -1;
-            }
-
-            memcpy(payload, iv, AES_IV_LEN);
-            memcpy(payload + AES_IV_LEN, ciphertext, (size_t)ciphertext_len);
-
             MsgHeader out_hdr = {0};
             out_hdr.version = PROTOCOL_VERSION;
             out_hdr.msg_type = MSG_CHAT;
             out_hdr.priority = priority;
             out_hdr.flags = 0;
-            out_hdr.payload_len = htonl(payload_len);
-            out_hdr.checksum = 0;
-            generate_random_bytes(out_hdr.msg_id, MSG_ID_LEN);
+            out_hdr.payload_len = htonl(sizeof(E2EEChatPayload));
+            memcpy(out_hdr.msg_id, msg_id, MSG_ID_LEN);
 
             pthread_mutex_lock(&target->send_lock);
             int ok = (tls_send(target->ssl, &out_hdr, sizeof(out_hdr)) == (int)sizeof(out_hdr) &&
-                      tls_send(target->ssl, payload, (int)payload_len) == (int)payload_len);
+                      tls_send(target->ssl, payload, sizeof(E2EEChatPayload)) == (int)sizeof(E2EEChatPayload));
             pthread_mutex_unlock(&target->send_lock);
 
-            free(payload);
             pthread_mutex_unlock(&g_connected_lock);
             return ok ? 0 : -1;
         }
     }
-
     pthread_mutex_unlock(&g_connected_lock);
 
-    if (queue_store(recipient, body, strlen(body), msg_id) == SUCCESS) {
+    /* Recipient offline: store exact encrypted end-to-end payload unmodified */
+    if (queue_store(recipient, payload, sizeof(E2EEChatPayload), msg_id) == SUCCESS) {
         return 1;
     }
 
     return -1;
 }
 
-/* Handle individual client connection (runs in thread) */
 void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *metrics) {
     (void)engine;
     SSL *ssl = NULL;
-    RatchetState ratchet;
-    pthread_mutex_t ratchet_lock = PTHREAD_MUTEX_INITIALIZER;
-    EVP_PKEY *server_dh = NULL;
     char username[MAX_USERNAME_LEN] = {0};
     int authenticated = 0;
 
@@ -331,6 +206,7 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
     char client_ip[64];
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
+    ids_record_connection(client_ip, metrics);
     if (ids_is_blocked(client_ip)) {
         fprintf(stderr, "[Server] Blocked IP attempted connection: %s\n", client_ip);
         socket_close(connfd);
@@ -346,131 +222,141 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
 
     printf("[Server] TLS connection established from %s\n", client_ip);
 
-    server_dh = dh_generate_keypair();
-    if (!server_dh) {
-        fprintf(stderr, "[Server] Failed to generate DH keypair\n");
+    /* Challenge-Response Authentication Handshake Loop */
+    uint8_t challenge[32];
+    generate_random_bytes(challenge, 32);
+
+    /* Step 1: Client uploads their public PreKey bundle or initiates handshake */
+    MsgHeader upload_hdr;
+    if (tls_recv(ssl, &upload_hdr, sizeof(upload_hdr)) != (int)sizeof(upload_hdr)) {
+        fprintf(stderr, "[Server] Failed to receive handshake header\n");
         goto cleanup;
     }
 
-    MsgHeader dh_init_hdr;
-    if (tls_recv(ssl, &dh_init_hdr, sizeof(dh_init_hdr)) != (int)sizeof(dh_init_hdr)) {
-        fprintf(stderr, "[Server] Failed to receive DH_INIT\n");
+    if (upload_hdr.msg_type != MSG_PREKEY_UPLOAD) {
+        fprintf(stderr, "[Server] Expected MSG_PREKEY_UPLOAD, got %d\n", upload_hdr.msg_type);
         goto cleanup;
     }
 
-    if (dh_init_hdr.msg_type != MSG_DH_INIT) {
-        fprintf(stderr, "[Server] Expected DH_INIT, got type %d\n", dh_init_hdr.msg_type);
+    uint32_t payload_len = ntohl(upload_hdr.payload_len);
+    if (payload_len != sizeof(PreKeyBundle)) {
+        fprintf(stderr, "[Server] Invalid PreKey bundle size: %u\n", payload_len);
         goto cleanup;
     }
 
-    uint8_t client_dh_pubkey[32];
-    uint32_t payload_len = ntohl(dh_init_hdr.payload_len);
-    if (payload_len != 32 || tls_recv(ssl, client_dh_pubkey, 32) != 32) {
-        fprintf(stderr, "[Server] Failed to receive client DH pubkey\n");
+    PreKeyBundle received_bundle;
+    if (tls_recv(ssl, &received_bundle, sizeof(PreKeyBundle)) != sizeof(PreKeyBundle)) {
+        fprintf(stderr, "[Server] Failed to receive PreKey bundle\n");
         goto cleanup;
     }
 
-    uint8_t server_dh_pubkey[32];
-    size_t pubkey_len = 32;
-    if (dh_get_public_key(server_dh, server_dh_pubkey, &pubkey_len) != SUCCESS) {
-        fprintf(stderr, "[Server] Failed to extract DH pubkey\n");
-        goto cleanup;
-    }
-
-    MsgHeader dh_resp_hdr = {
+    /* Challenge-Response request setup */
+    MsgHeader challenge_hdr = {
         .version = PROTOCOL_VERSION,
-        .msg_type = MSG_DH_RESP,
+        .msg_type = MSG_AUTH_REQ, /* Serve as authentication challenge */
         .priority = PRIORITY_NORMAL,
         .flags = 0,
         .payload_len = htonl(32),
         .checksum = 0
     };
-    generate_random_bytes(dh_resp_hdr.msg_id, MSG_ID_LEN);
+    generate_random_bytes(challenge_hdr.msg_id, MSG_ID_LEN);
 
-    if (tls_send(ssl, &dh_resp_hdr, sizeof(dh_resp_hdr)) <= 0 ||
-        tls_send(ssl, server_dh_pubkey, 32) <= 0) {
-        fprintf(stderr, "[Server] Failed to send DH_RESP\n");
+    if (tls_send(ssl, &challenge_hdr, sizeof(challenge_hdr)) <= 0 ||
+        tls_send(ssl, challenge, 32) <= 0) {
+        fprintf(stderr, "[Server] Failed to transmit challenge\n");
         goto cleanup;
     }
 
-    EVP_PKEY *client_dh = dh_pubkey_from_bytes(client_dh_pubkey, 32);
-    if (!client_dh) {
-        fprintf(stderr, "[Server] Failed to parse client DH pubkey\n");
+    /* Step 2: Receive Client auth response signature */
+    MsgHeader auth_resp_hdr;
+    if (tls_recv(ssl, &auth_resp_hdr, sizeof(auth_resp_hdr)) != sizeof(auth_resp_hdr)) {
+        fprintf(stderr, "[Server] Failed to receive AUTH_RESP header\n");
         goto cleanup;
     }
 
-    uint8_t shared_secret[32];
-    size_t secret_len = 32;
-    if (dh_compute_shared_secret(server_dh, client_dh, shared_secret, &secret_len) != SUCCESS) {
-        fprintf(stderr, "[Server] Failed to compute shared secret\n");
-        EVP_PKEY_free(client_dh);
+    if (auth_resp_hdr.msg_type != MSG_AUTH_REQ) {
+        fprintf(stderr, "[Server] Expected MSG_AUTH_REQ signature frame\n");
         goto cleanup;
     }
 
-    if (ratchet_init(&ratchet, shared_secret, secret_len, 0) != SUCCESS) {
-        fprintf(stderr, "[Server] Failed to initialize ratchet\n");
-        OPENSSL_cleanse(shared_secret, 32);
-        EVP_PKEY_free(client_dh);
+    payload_len = ntohl(auth_resp_hdr.payload_len);
+    if (payload_len != sizeof(AuthRequest)) {
+        fprintf(stderr, "[Server] Invalid AuthRequest payload size\n");
         goto cleanup;
     }
 
-    OPENSSL_cleanse(shared_secret, 32);
-    EVP_PKEY_free(client_dh);
-
-    printf("[Server] Ratchet initialized\n");
-
-    MsgHeader auth_hdr;
-    if (tls_recv(ssl, &auth_hdr, sizeof(auth_hdr)) != (int)sizeof(auth_hdr)) {
-        fprintf(stderr, "[Server] Failed to receive AUTH_REQ\n");
+    AuthRequest auth_req;
+    if (tls_recv(ssl, &auth_req, sizeof(AuthRequest)) != sizeof(AuthRequest)) {
+        fprintf(stderr, "[Server] Failed to read AuthRequest\n");
         goto cleanup;
     }
 
-    if (auth_hdr.msg_type != MSG_AUTH_REQ) {
-        fprintf(stderr, "[Server] Expected AUTH_REQ\n");
+    /* Record authentication attempt (Brute force flood check) */
+    ids_record_auth_attempt(client_ip, metrics);
+    if (ids_is_blocked(client_ip)) {
+        fprintf(stderr, "[Server] Blocked IP attempted authentication: %s\n", client_ip);
         goto cleanup;
     }
 
-    payload_len = ntohl(auth_hdr.payload_len);
-    uint8_t *auth_payload = malloc(payload_len);
-    if (!auth_payload || tls_recv(ssl, auth_payload, (int)payload_len) != (int)payload_len) {
-        fprintf(stderr, "[Server] Failed to receive auth payload\n");
-        free(auth_payload);
+    strncpy(username, auth_req.username, MAX_USERNAME_LEN - 1);
+    username[MAX_USERNAME_LEN - 1] = '\0';
+
+    /* Validate authentication timestamp drift (Timestamp Anomaly Check) */
+    uint64_t client_ts = be64toh(auth_req.timestamp);
+    time_t now = time(NULL);
+    uint64_t now_ms = (uint64_t)now * 1000;
+    long long diff = (long long)client_ts - (long long)now_ms;
+    if (diff < 0) diff = -diff;
+    if (diff > 300 * 1000) { /* > 300 seconds (5 minutes) drift */
+        fprintf(stderr, "[Server] Authentication failed for user: %s (Timestamp anomaly: diff=%lld ms)\n", 
+                username, diff);
+        ids_record_invalid_timestamp(client_ip, metrics);
+        send_control_message(ssl, MSG_AUTH_FAIL, NULL, 0);
         goto cleanup;
     }
 
-    if (payload_len >= MAX_USERNAME_LEN) {
-        strncpy(username, (char *)auth_payload, MAX_USERNAME_LEN - 1);
-        username[MAX_USERNAME_LEN - 1] = '\0';
-        authenticated = 1;
-        printf("[Server] Client authenticated as: %s\n", username);
+    /* Dynamically register user Identity public key inside auth manager */
+    EVP_PKEY *user_id_pub = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, received_bundle.identity_pub, 32);
+    if (!user_id_pub) {
+        goto cleanup;
     }
+    auth_register_pubkey(username, user_id_pub);
+    EVP_PKEY_free(user_id_pub);
 
-    free(auth_payload);
-
-    MsgHeader auth_ok_hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_AUTH_OK,
-        .priority = PRIORITY_NORMAL,
-        .flags = 0,
-        .payload_len = 0,
-        .checksum = 0
-    };
-    generate_random_bytes(auth_ok_hdr.msg_id, MSG_ID_LEN);
-
-    if (tls_send(ssl, &auth_ok_hdr, sizeof(auth_ok_hdr)) <= 0) {
-        fprintf(stderr, "[Server] Failed to send AUTH_OK\n");
+    /* Verify signature of 32-byte challenge payload */
+    if (auth_verify_login(username, challenge, 32, auth_req.signature, 64) != SUCCESS) {
+        fprintf(stderr, "[Server] Authentication failed for user: %s\n", username);
+        send_control_message(ssl, MSG_AUTH_FAIL, NULL, 0);
+        ids_record_auth_fail_ex(client_ip, username, metrics);
         goto cleanup;
     }
 
-    register_connected_client(username, ssl, &ratchet, &ratchet_lock);
+    /* Auth successful: store PreKey Bundle in static lookup segment */
+    pthread_mutex_lock(&g_prekeys_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!g_client_prekeys[i].has_bundle || strcmp(g_client_prekeys[i].username, username) == 0) {
+            strncpy(g_client_prekeys[i].username, username, MAX_USERNAME_LEN - 1);
+            g_client_prekeys[i].bundle = received_bundle;
+            g_client_prekeys[i].has_bundle = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_prekeys_lock);
 
+    authenticated = 1;
+    printf("[Server] User authenticated: %s (Ed25519 Identity Registered)\n", username);
+    send_control_message(ssl, MSG_AUTH_OK, NULL, 0);
+
+    register_connected_client(username, ssl);
+
+    /* Drain E2EE offline queue blindly */
     int queued_count = queue_count(username);
     if (queued_count > 0) {
-        printf("[Server] Pending offline messages for %s: %d\n", username, queued_count);
+        printf("[Server] Draining %d encrypted messages to reconnecting client %s\n", queued_count, username);
+        queue_drain(username, offline_delivery_callback, ssl);
     }
 
-    printf("[Server] Entering message loop for %s\n", username);
-
+    /* Active client message processing loop */
     while (1) {
         MsgHeader hdr;
         int n = tls_recv(ssl, &hdr, sizeof(hdr));
@@ -481,144 +367,159 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
         }
 
         if (n != (int)sizeof(hdr)) {
-            fprintf(stderr, "[Server] Incomplete header received\n");
+            fprintf(stderr, "[Server] Incomplete header\n");
+            ids_record_malformed_packet(client_ip, "Incomplete wire header block", metrics);
             break;
         }
 
+        /* Validate header fields strictly (Malformed Packet Check) */
+        int valid_type = (hdr.msg_type >= MSG_PREKEY_UPLOAD && hdr.msg_type <= MSG_USER_LIST_RESP) || hdr.msg_type == MSG_ERROR;
+        if (hdr.version != PROTOCOL_VERSION) {
+            ids_record_malformed_packet(client_ip, "Invalid protocol header version", metrics);
+            break;
+        }
+        if (!valid_type) {
+            ids_record_malformed_packet(client_ip, "Unknown/invalid message type field", metrics);
+            break;
+        }
+        uint32_t incoming_payload_len = ntohl(hdr.payload_len);
+        if (incoming_payload_len > RECV_BUFFER_SIZE) {
+            ids_record_malformed_packet(client_ip, "Oversized payload length header", metrics);
+            break;
+        }
+
+        /* Record received message details (Message rate checks) */
+        ids_record_message(client_ip, incoming_payload_len, metrics);
+        if (ids_is_blocked(client_ip)) {
+            fprintf(stderr, "[Server] IP is blocked due to message flood: %s\n", client_ip);
+            break;
+        }
+
+        /* Server-Blind E2EE Routing */
         if (hdr.msg_type == MSG_CHAT) {
             payload_len = ntohl(hdr.payload_len);
-            uint8_t *encrypted = malloc(payload_len);
-
-            if (!encrypted || tls_recv(ssl, encrypted, (int)payload_len) != (int)payload_len) {
-                fprintf(stderr, "[Server] Failed to receive chat payload\n");
-                free(encrypted);
-                continue;
+            if (payload_len != sizeof(E2EEChatPayload)) {
+                fprintf(stderr, "[Server] Invalid E2EE payload length: %u\n", payload_len);
+                ids_record_malformed_packet(client_ip, "Invalid MSG_CHAT payload size", metrics);
+                break;
             }
 
-            uint8_t *recv_iv = encrypted;
-            uint8_t *recv_ciphertext = encrypted + AES_IV_LEN;
-            int recv_ciphertext_len = (int)payload_len - AES_IV_LEN;
-
-            uint8_t recv_msg_key[RATCHET_KEY_LEN];
-            pthread_mutex_lock(&ratchet_lock);
-            if (ratchet_recv_step(&ratchet, recv_msg_key) != SUCCESS) {
-                pthread_mutex_unlock(&ratchet_lock);
-                fprintf(stderr, "[Server] Ratchet recv step failed\n");
-                OPENSSL_cleanse(recv_msg_key, sizeof(recv_msg_key));
-                free(encrypted);
-                continue;
-            }
-            pthread_mutex_unlock(&ratchet_lock);
-
-            uint8_t plaintext_buf[MSG_PADDED_SIZE + 64];
-            int plaintext_len = aes_decrypt(recv_msg_key, recv_iv, recv_ciphertext,
-                                            recv_ciphertext_len, plaintext_buf);
-            OPENSSL_cleanse(recv_msg_key, sizeof(recv_msg_key));
-
-            if (plaintext_len < 0) {
-                fprintf(stderr, "[Server] Decryption failed\n");
-                free(encrypted);
-                continue;
+            E2EEChatPayload chat_payload;
+            if (tls_recv(ssl, &chat_payload, sizeof(E2EEChatPayload)) != sizeof(E2EEChatPayload)) {
+                fprintf(stderr, "[Server] Failed to receive E2EE chat payload\n");
+                break;
             }
 
-            uint8_t unpadded[MSG_PADDED_SIZE];
-            int unpadded_len = msg_unpad(plaintext_buf, plaintext_len, unpadded);
-            if (unpadded_len < 0) {
-                fprintf(stderr, "[Server] Unpadding failed\n");
-                free(encrypted);
-                continue;
-            }
-            unpadded[unpadded_len] = '\0';
-
+            /* Identify recipient from ciphertext payload header cleanly */
             char recipient[MAX_USERNAME_LEN] = {0};
-            char body[MAX_DIRECTED_MSG_LEN] = {0};
-            if (parse_directed_message(unpadded, unpadded_len,
-                                       recipient, sizeof(recipient),
-                                       body, sizeof(body)) != 0) {
-                const char *usage = "Use directed format: @username message";
-                send_control_message(ssl, MSG_ERROR, (const uint8_t *)usage, (uint32_t)strlen(usage));
-                free(encrypted);
-                continue;
-            }
-
-            if (strcmp(recipient, username) == 0) {
-                const char *msg = "Self-target is blocked. Choose another client.";
-                send_control_message(ssl, MSG_ERROR, (const uint8_t *)msg, (uint32_t)strlen(msg));
-                free(encrypted);
-                continue;
-            }
-
-            int route_result = route_directed_message(username, recipient, body, hdr.priority, hdr.msg_id);
-            if (route_result == 0) {
-                printf("[Server] Routed message %s -> %s\n", username, recipient);
-            } else if (route_result == 1) {
-                const char *queued = "Recipient offline. Message queued.";
-                send_control_message(ssl, MSG_OFFLINE_STORED, (const uint8_t *)queued, (uint32_t)strlen(queued));
-                printf("[Server] Recipient %s offline; queued message from %s\n", recipient, username);
+            char *space = strchr(chat_payload.sender, ' ');
+            if (space) {
+                /* Target parsing from custom layout: sender is written as "sender recipient" for routing */
+                *space = '\0';
+                strncpy(recipient, space + 1, MAX_USERNAME_LEN - 1);
             } else {
-                const char *err = "Delivery failed for recipient.";
+                /* Fallback to broadcast */
+                strcpy(recipient, "all");
+            }
+
+            /* Blind route the payload */
+            int route_result = route_directed_message(username, recipient, &chat_payload, hdr.priority, hdr.msg_id);
+            if (route_result == 0) {
+                printf("[Server] Blind routed E2EE message %s -> %s\n", username, recipient);
+            } else if (route_result == 1) {
+                const char *queued = "Recipient offline. Message queued E2EE.";
+                send_control_message(ssl, MSG_OFFLINE_STORED, (const uint8_t *)queued, (uint32_t)strlen(queued));
+                printf("[Server] Queued E2EE frame for offline recipient: %s\n", recipient);
+            } else {
+                const char *err = "E2EE delivery failed.";
                 send_control_message(ssl, MSG_ERROR, (const uint8_t *)err, (uint32_t)strlen(err));
-                fprintf(stderr, "[Server] Failed to route message %s -> %s\n", username, recipient);
             }
-
-            free(encrypted);
             continue;
         }
 
-        if (hdr.msg_type == MSG_RATCHET_DH) {
+        /* Signal-Style PreKey bundle vending */
+        if (hdr.msg_type == MSG_PREKEY_REQ) {
             payload_len = ntohl(hdr.payload_len);
-            if (payload_len != DH_PUBKEY_LEN) {
-                uint8_t *discard = malloc(payload_len);
-                if (discard) { tls_recv(ssl, discard, payload_len); free(discard); }
-                continue;
+            char req_user[MAX_USERNAME_LEN] = {0};
+            if (payload_len < MAX_USERNAME_LEN && tls_recv(ssl, req_user, payload_len) == (int)payload_len) {
+                req_user[payload_len] = '\0';
+
+                PreKeyBundle response_bundle;
+                int found = 0;
+
+                pthread_mutex_lock(&g_prekeys_lock);
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (g_client_prekeys[i].has_bundle && strcmp(g_client_prekeys[i].username, req_user) == 0) {
+                        response_bundle = g_client_prekeys[i].bundle;
+                        
+                        /* Vend/consume exactly one One-Time PreKey (OTPK) */
+                        if (g_client_prekeys[i].bundle.otpk_count > 0) {
+                            g_client_prekeys[i].bundle.otpk_count--;
+                            response_bundle.otpk_count = 1; /* Indicate one OTPK returned */
+                        } else {
+                            response_bundle.otpk_count = 0;
+                        }
+                        found = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_prekeys_lock);
+
+                if (found) {
+                    MsgHeader resp_hdr = {
+                        .version = PROTOCOL_VERSION,
+                        .msg_type = MSG_PREKEY_RESP,
+                        .priority = PRIORITY_NORMAL,
+                        .flags = 0,
+                        .payload_len = htonl(sizeof(PreKeyBundle)),
+                        .checksum = 0
+                    };
+                    generate_random_bytes(resp_hdr.msg_id, MSG_ID_LEN);
+                    tls_send(ssl, &resp_hdr, sizeof(resp_hdr));
+                    tls_send(ssl, &response_bundle, sizeof(PreKeyBundle));
+                    printf("[Server] Vended PreKey bundle of %s to requesting client %s\n", req_user, username);
+                } else {
+                    const char *err = "PreKey bundle not found for user.";
+                    send_control_message(ssl, MSG_ERROR, (const uint8_t *)err, (uint32_t)strlen(err));
+                }
             }
-            uint8_t peer_pubkey_bytes[DH_PUBKEY_LEN];
-            if (tls_recv(ssl, peer_pubkey_bytes, DH_PUBKEY_LEN) != DH_PUBKEY_LEN) {
-                continue;
-            }
-            EVP_PKEY *peer_new_pubkey = dh_pubkey_from_bytes(peer_pubkey_bytes, DH_PUBKEY_LEN);
-            if (!peer_new_pubkey) continue;
-
-            pthread_mutex_lock(&ratchet_lock);
-            ratchet_dh_step(&ratchet, peer_new_pubkey);
-            uint8_t server_new_pubkey[DH_PUBKEY_LEN];
-            size_t spk_len = DH_PUBKEY_LEN;
-            int got_pubkey = (ratchet.dh_keypair &&
-                              dh_get_public_key(ratchet.dh_keypair,
-                                                server_new_pubkey, &spk_len) == SUCCESS);
-            pthread_mutex_unlock(&ratchet_lock);
-            EVP_PKEY_free(peer_new_pubkey);
-
-            if (got_pubkey) {
-                MsgHeader resp_hdr = {0};
-                resp_hdr.version = PROTOCOL_VERSION;
-                resp_hdr.msg_type = MSG_RATCHET_DH;
-                resp_hdr.priority = PRIORITY_NORMAL;
-                resp_hdr.payload_len = htonl(DH_PUBKEY_LEN);
-                generate_random_bytes(resp_hdr.msg_id, MSG_ID_LEN);
-                tls_send(ssl, &resp_hdr, sizeof(resp_hdr));
-                tls_send(ssl, server_new_pubkey, DH_PUBKEY_LEN);
-            }
-
-            printf("[Server] DH ratchet step for %s\n", username);
-            continue;
-        }
-
-        if (hdr.msg_type == MSG_JOIN_ROOM || hdr.msg_type == MSG_LEAVE_ROOM) {
-            printf("[Server] Room operation from %s\n", username);
             continue;
         }
 
         if (hdr.msg_type == MSG_USER_LIST_REQ) {
             char user_list[1024];
             build_online_user_list(user_list, sizeof(user_list), username);
-            send_control_message(ssl, MSG_USER_LIST_RESP,
-                                 (const uint8_t *)user_list,
-                                 (uint32_t)strlen(user_list));
+            send_control_message(ssl, MSG_USER_LIST_RESP, (const uint8_t *)user_list, (uint32_t)strlen(user_list));
             continue;
         }
 
-        fprintf(stderr, "[Server] Unknown message type: %d\n", hdr.msg_type);
+        if (hdr.msg_type == MSG_RATCHET_DH) {
+            /* Relay Ephemeral Ratchet DH key refresh directly to target peer */
+            payload_len = ntohl(hdr.payload_len);
+            if (payload_len != 32) continue;
+            uint8_t key_bytes[32];
+            if (tls_recv(ssl, key_bytes, 32) == 32) {
+                /* Broadcast to all peers or direct recipient - simplified relay */
+                pthread_mutex_lock(&g_connected_lock);
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (g_connected[i].active && strcmp(g_connected[i].username, username) != 0) {
+                        MsgHeader dh_hdr = {
+                            .version = PROTOCOL_VERSION,
+                            .msg_type = MSG_RATCHET_DH,
+                            .priority = PRIORITY_NORMAL,
+                            .payload_len = htonl(32)
+                        };
+                        generate_random_bytes(dh_hdr.msg_id, MSG_ID_LEN);
+                        pthread_mutex_lock(&g_connected[i].send_lock);
+                        tls_send(g_connected[i].ssl, &dh_hdr, sizeof(dh_hdr));
+                        tls_send(g_connected[i].ssl, key_bytes, 32);
+                        pthread_mutex_unlock(&g_connected[i].send_lock);
+                    }
+                }
+                pthread_mutex_unlock(&g_connected_lock);
+            }
+            continue;
+        }
     }
 
 cleanup:
@@ -626,18 +527,9 @@ cleanup:
         unregister_connected_client(username);
         printf("[Server] Client %s logged out\n", username);
     }
-
-    ratchet_destroy(&ratchet);
-    pthread_mutex_destroy(&ratchet_lock);
-
-    if (server_dh) {
-        EVP_PKEY_free(server_dh);
-    }
-
     if (ssl) {
         tls_close(ssl);
     }
-
     close(connfd);
     (void)metrics;
 }

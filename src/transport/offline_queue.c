@@ -6,17 +6,15 @@
 #include <string.h>
 #include <time.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
 #ifdef PLATFORM_WINDOWS
 #include <direct.h>
 #include <io.h>
 #define mkdir(path, mode) _mkdir(path)
-#define stat _stat
-#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
-typedef struct _finddata_t DIR_ENTRY;
 #else
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <dirent.h>
 #include <unistd.h>
 #endif
 
@@ -58,7 +56,7 @@ int queue_store(const char *username,
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t timestamp_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     
-    snprintf(filename, sizeof(filename), "%s/%lu_", user_dir, timestamp_ms);
+    snprintf(filename, sizeof(filename), "%s/%llu_", user_dir, (unsigned long long)timestamp_ms);
     
     /* Append hex message ID */
     char *ptr = filename + strlen(filename);

@@ -81,6 +81,11 @@ static void *server_thread(void *arg) {
 }
 
 int main(void) {
+    if (platform_socket_init() != 0) {
+        fprintf(stderr, "FAIL: platform_socket_init\n");
+        return 1;
+    }
+
     int passed = 0;
     int failed = 0;
 
@@ -88,6 +93,7 @@ int main(void) {
 
     if (tls_init() != SUCCESS) {
         fprintf(stderr, "FAIL: tls_init\n");
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -101,6 +107,7 @@ int main(void) {
         printf("FAIL (check that 'make certs' has been run)\n");
         failed++;
         tls_cleanup();
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -115,6 +122,7 @@ int main(void) {
         failed++;
         tls_free_ctx(server_ctx);
         tls_cleanup();
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -123,7 +131,7 @@ int main(void) {
 
     /* Set up listening socket */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("socket"); return 1; }
+    if (listen_fd < 0) { perror("socket"); platform_socket_cleanup(); return 1; }
 
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -137,11 +145,13 @@ int main(void) {
     if (bind(listen_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
         perror("bind");
         close(listen_fd);
+        platform_socket_cleanup();
         return 1;
     }
     if (listen(listen_fd, 1) < 0) {
         perror("listen");
         close(listen_fd);
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -225,5 +235,6 @@ done:
     passed++;
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
+    platform_socket_cleanup();
     return (failed > 0) ? 1 : 0;
 }

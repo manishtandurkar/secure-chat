@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <endian.h>
 
 #ifdef PLATFORM_WINDOWS
 /* Windows doesn't have gettimeofday or endian.h */

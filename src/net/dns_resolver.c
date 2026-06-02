@@ -3,7 +3,6 @@
 #include "platform_compat.h"
 #include <stdio.h>
 #include <string.h>
-#include <netdb.h>
 
 int dns_resolve(const char *hostname, char *ip_out, size_t ip_out_len) {
     if (!hostname || !ip_out || ip_out_len < INET_ADDRSTRLEN) {

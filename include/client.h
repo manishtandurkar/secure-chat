@@ -23,7 +23,10 @@ typedef struct {
     pthread_t send_thread;
     pthread_t udp_thread;
     RatchetState ratchet;
-    EVP_PKEY *rsa_keypair;
+    EVP_PKEY *identity_keypair;     /* Ed25519 Signature Identity */
+    EVP_PKEY *dh_identity_keypair;  /* X25519 DH Identity Key */
+    EVP_PKEY *signed_prekey_keypair; /* X25519 Signed PreKey */
+    EVP_PKEY **otpk_keys;           /* Cache of Bob's One-Time PreKeys */
     uint8_t dedup_set[DEDUP_WINDOW][MSG_ID_LEN];
     int dedup_idx;
     pthread_mutex_t ratchet_lock;

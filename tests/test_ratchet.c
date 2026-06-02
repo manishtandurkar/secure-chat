@@ -96,8 +96,8 @@ int test_forward_secrecy(void) {
     for (int i = 0; i < 50; i++) {
         RAND_bytes(plaintexts[i], 32);
         aes_generate_iv(ivs[i]);
-        
-        int ct_len = aes_encrypt(keys[i], ivs[i], plaintexts[i], 32, ciphertexts[i]);
+        uint8_t tag[16];
+        int ct_len = aes_encrypt(keys[i], ivs[i], plaintexts[i], 32, ciphertexts[i], tag);
         if (ct_len < 0) {
             printf("%s Encryption failed at %d\n", TEST_FAIL, i);
             ratchet_destroy(&state);

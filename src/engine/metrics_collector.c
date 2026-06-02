@@ -1,4 +1,5 @@
 #include "adaptive_engine.h"
+#include "network_monitor.h"
 #include <pthread.h>
 #include <string.h>
 
@@ -68,13 +69,15 @@ void metrics_record_replay(Metrics *m) {
     pthread_mutex_unlock(&metrics_mutex);
 }
 
-/* Record round-trip time with smoothing */
+/* Record round-trip time with smoothing and jitter updates */
 void metrics_record_rtt(Metrics *m, uint32_t rtt_ms) {
     if (!m) {
         return;
     }
     
     pthread_mutex_lock(&metrics_mutex);
+    
+    uint32_t prev_rtt = m->rtt_ms;
     
     /* Exponential moving average: smoothed_rtt = 0.875 * old + 0.125 * new */
     if (m->rtt_ms == 0) {
@@ -84,4 +87,13 @@ void metrics_record_rtt(Metrics *m, uint32_t rtt_ms) {
     }
     
     pthread_mutex_unlock(&metrics_mutex);
+    
+    /* Update network intelligence layer (jitter + RTT history) */
+    if (prev_rtt > 0) {
+        uint32_t jitter = (rtt_ms > prev_rtt)
+                          ? (rtt_ms - prev_rtt)
+                          : (prev_rtt - rtt_ms);
+        nm_record_jitter(jitter);
+    }
+    nm_record_rtt_sample(rtt_ms);
 }

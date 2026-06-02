@@ -1,8 +1,8 @@
 #ifndef UDP_NOTIFY_H
 #define UDP_NOTIFY_H
 
+#include "platform_compat.h"
 #include "common.h"
-#include <netinet/in.h>
 
 /* Notification types */
 typedef enum {

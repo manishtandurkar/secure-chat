@@ -36,6 +36,7 @@
 #include <windows.h>
 #include <io.h>
 #include <process.h>
+#include <pthread.h>
 #include <stdio.h>
 
 /* Link against Winsock library */
@@ -76,6 +77,19 @@ typedef int socklen_t;
 /* Windows doesn't have these POSIX signal macros */
 #ifndef SIGPIPE
 #define SIGPIPE 13
+#endif
+
+/* Fallback for EAI_SYSTEM on Windows */
+#ifndef EAI_SYSTEM
+#define EAI_SYSTEM -11
+#endif
+
+/* Endianness fallbacks on Windows */
+#ifndef htobe64
+#define htobe64(x) _byteswap_uint64(x)
+#endif
+#ifndef be64toh
+#define be64toh(x) _byteswap_uint64(x)
 #endif
 
 /* Windows doesn't have fork() - provide compile-time error */

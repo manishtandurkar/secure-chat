@@ -62,5 +62,5 @@ int auth_verify_login(const char *username, const unsigned char *data,
     }
     
     /* Verify signature */
-    return rsa_verify(pubkey, data, data_len, signature, sig_len);
+    return ed25519_verify(pubkey, data, data_len, signature, sig_len);
 }

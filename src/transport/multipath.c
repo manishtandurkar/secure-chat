@@ -1,12 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 #include "platform_compat.h"
 #include "multipath.h"
+#include "network_monitor.h"
 #include "message.h"
 #include "tls_layer.h"
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #include <openssl/rand.h>
 
 /* Deduplication ring buffer */
@@ -39,12 +41,13 @@ int dedup_check(const uint8_t id[MSG_ID_LEN]) {
     return 0; /* New message */
 }
 
-/* Send over both TCP and UDP */
+/* Send over both TCP and UDP with path-intelligence ordering */
 int multipath_send(SSL *ssl, int udp_fd,
                    const struct sockaddr_in *udp_dest,
                    const void *payload, size_t payload_len,
                    uint8_t priority,
                    const EngineState *engine) {
+    (void)priority; /* Currently used for future priority-aware queuing */
     if (!ssl || !payload || !engine) {
         return ERROR_NETWORK;
     }
@@ -52,33 +55,89 @@ int multipath_send(SSL *ssl, int udp_fd,
     int tcp_success = 0;
     int udp_success = 0;
     
+    /* Determine preferred path based on transport health */
+    PreferredPath pref = multipath_preferred_path();
+    
     /* Attempt sends with retries */
     for (int attempt = 0; attempt < engine->max_retries; attempt++) {
-        /* Try TCP send */
-        if (!tcp_success && tls_send(ssl, payload, payload_len) > 0) {
-            tcp_success = 1;
+        struct timespec t_start, t_end;
+        
+        /* --- TCP send (preferred or both) --- */
+        if (!tcp_success && (pref == PATH_TCP || pref == PATH_BOTH)) {
+#ifdef CLOCK_MONOTONIC
+            clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
+            int tcp_ok = (tls_send(ssl, payload, (int)payload_len) > 0);
+#ifdef CLOCK_MONOTONIC
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+            uint32_t lat_ms = (uint32_t)(
+                (t_end.tv_sec  - t_start.tv_sec)  * 1000 +
+                (t_end.tv_nsec - t_start.tv_nsec) / 1000000);
+#else
+            uint32_t lat_ms = 0;
+#endif
+            metrics_record_tcp_send(tcp_ok, lat_ms);
+            if (tcp_ok) tcp_success = 1;
         }
         
-        /* Try UDP send if enabled and destination provided */
-        if (engine->use_udp_backup && udp_fd >= 0 && udp_dest && !udp_success) {
-            if (sendto(udp_fd, payload, payload_len, 0,
-                      (struct sockaddr *)udp_dest, sizeof(*udp_dest)) > 0) {
-                udp_success = 1;
+        /* --- UDP send (backup or both or preferred when TCP unhealthy) --- */
+        if (!udp_success && engine->use_udp_backup &&
+            udp_fd >= 0 && udp_dest &&
+            (pref == PATH_UDP || pref == PATH_BOTH)) {
+#ifdef CLOCK_MONOTONIC
+            clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
+            int udp_ok = (sendto(udp_fd, (const char *)payload, (int)payload_len, 0,
+                                 (struct sockaddr *)udp_dest,
+                                 sizeof(*udp_dest)) > 0);
+#ifdef CLOCK_MONOTONIC
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+            uint32_t lat_ms = (uint32_t)(
+                (t_end.tv_sec  - t_start.tv_sec)  * 1000 +
+                (t_end.tv_nsec - t_start.tv_nsec) / 1000000);
+#else
+            uint32_t lat_ms = 0;
+#endif
+            metrics_record_udp_send(udp_ok, lat_ms);
+            if (udp_ok) udp_success = 1;
+        }
+        
+        /* --- Fallback: try non-preferred path if preferred failed --- */
+        if (!tcp_success && !udp_success) {
+            /* Try TCP regardless of preference */
+            if (!tcp_success) {
+                int tcp_ok = (tls_send(ssl, payload, (int)payload_len) > 0);
+                metrics_record_tcp_send(tcp_ok, 0);
+                if (tcp_ok) tcp_success = 1;
+            }
+            /* Try UDP regardless of preference */
+            if (!udp_success && engine->use_udp_backup && udp_fd >= 0 && udp_dest) {
+                int udp_ok = (sendto(udp_fd, (const char *)payload, (int)payload_len, 0,
+                                     (struct sockaddr *)udp_dest,
+                                     sizeof(*udp_dest)) > 0);
+                metrics_record_udp_send(udp_ok, 0);
+                if (udp_ok) udp_success = 1;
             }
         }
         
-        /* If either succeeded, we're done */
+        /* If either succeeded, record bytes and stop retrying */
         if (tcp_success || udp_success) {
+            metrics_record_tx_bytes(payload_len);
+            metrics_record_delivery(1);
             break;
         }
         
         /* Apply delay based on engine config */
         if (engine->random_delay) {
-            int delay_ms = 100 + (rand() % 400); /* 100-500ms */
+            int delay_ms = 100 + (rand() % 400); /* 100–500ms */
             usleep(delay_ms * 1000);
         } else {
             usleep(engine->retry_delay_ms * 1000);
         }
+    }
+    
+    if (!tcp_success && !udp_success) {
+        metrics_record_delivery(0); /* Undelivered */
     }
     
     return (tcp_success || udp_success) ? SUCCESS : ERROR_NETWORK;
