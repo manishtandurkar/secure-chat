@@ -27,6 +27,7 @@ typedef struct {
     uint8_t dedup_set[DEDUP_WINDOW][MSG_ID_LEN];
     int dedup_idx;
     pthread_mutex_t ratchet_lock;
+    int dh_ratchet_freq; /* Messages between DH ratchet steps (from engine, default 10) */
 } ClientState;
 
 typedef void (*ClientLogCallback)(const char *line, void *user_data);

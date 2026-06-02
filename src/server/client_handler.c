@@ -95,6 +95,17 @@ static void register_connected_client(const char *username,
     pthread_mutex_unlock(&g_connected_lock);
 }
 
+void broadcast_engine_state(AdaptiveMode new_mode) {
+    uint8_t mode_byte = (uint8_t)new_mode;
+    pthread_mutex_lock(&g_connected_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!g_connected[i].active) continue;
+        send_control_message(g_connected[i].ssl, MSG_ENGINE_STATE, &mode_byte, 1);
+    }
+    pthread_mutex_unlock(&g_connected_lock);
+    fprintf(stderr, "[Engine] Broadcast mode=%d to connected clients\n", (int)new_mode);
+}
+
 static void unregister_connected_client(const char *username) {
     pthread_mutex_lock(&g_connected_lock);
 
@@ -551,6 +562,45 @@ void handle_client(int connfd, SSL_CTX *tls_ctx, EngineState *engine, Metrics *m
             }
 
             free(encrypted);
+            continue;
+        }
+
+        if (hdr.msg_type == MSG_RATCHET_DH) {
+            payload_len = ntohl(hdr.payload_len);
+            if (payload_len != DH_PUBKEY_LEN) {
+                uint8_t *discard = malloc(payload_len);
+                if (discard) { tls_recv(ssl, discard, payload_len); free(discard); }
+                continue;
+            }
+            uint8_t peer_pubkey_bytes[DH_PUBKEY_LEN];
+            if (tls_recv(ssl, peer_pubkey_bytes, DH_PUBKEY_LEN) != DH_PUBKEY_LEN) {
+                continue;
+            }
+            EVP_PKEY *peer_new_pubkey = dh_pubkey_from_bytes(peer_pubkey_bytes, DH_PUBKEY_LEN);
+            if (!peer_new_pubkey) continue;
+
+            pthread_mutex_lock(&ratchet_lock);
+            ratchet_dh_step(&ratchet, peer_new_pubkey);
+            uint8_t server_new_pubkey[DH_PUBKEY_LEN];
+            size_t spk_len = DH_PUBKEY_LEN;
+            int got_pubkey = (ratchet.dh_keypair &&
+                              dh_get_public_key(ratchet.dh_keypair,
+                                                server_new_pubkey, &spk_len) == SUCCESS);
+            pthread_mutex_unlock(&ratchet_lock);
+            EVP_PKEY_free(peer_new_pubkey);
+
+            if (got_pubkey) {
+                MsgHeader resp_hdr = {0};
+                resp_hdr.version = PROTOCOL_VERSION;
+                resp_hdr.msg_type = MSG_RATCHET_DH;
+                resp_hdr.priority = PRIORITY_NORMAL;
+                resp_hdr.payload_len = htonl(DH_PUBKEY_LEN);
+                generate_random_bytes(resp_hdr.msg_id, MSG_ID_LEN);
+                tls_send(ssl, &resp_hdr, sizeof(resp_hdr));
+                tls_send(ssl, server_new_pubkey, DH_PUBKEY_LEN);
+            }
+
+            printf("[Server] DH ratchet step for %s\n", username);
             continue;
         }
 
