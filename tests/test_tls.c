@@ -134,7 +134,7 @@ int main(void) {
     if (listen_fd < 0) { perror("socket"); platform_socket_cleanup(); return 1; }
 
     int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));

@@ -25,7 +25,6 @@ int test_engine_init(void) {
     printf("\n=== Test 1: Engine Initialization ===\n");
     
     EngineState state;
-    Metrics metrics;
     
     if (engine_init(&state) != 0) {
         printf("%s Engine init failed\n", TEST_FAIL);

@@ -92,7 +92,11 @@ bin/client_phase1: $(OBJ_PHASE1_CLIENT) $(OBJ_PHASE1_COMMON)
 
 # Create bin directory
 bin:
+ifeq ($(DETECTED_OS),Windows)
+	if not exist bin $(MKDIR) bin
+else
 	mkdir -p bin
+endif
 
 # Build server
 server: bin bin/server
@@ -125,10 +129,16 @@ bin/client_gtk: $(OBJ_GTK_CLIENT) $(OBJ_COMMON)
 
 # Generate TLS certificates
 certs:
+ifeq ($(DETECTED_OS),Windows)
+	if not exist certs $(MKDIR) certs
+	openssl req -x509 -newkey rsa:4096 -keyout certs\server.key -out certs\server.crt -days 365 -nodes -subj "/CN=localhost"
+	copy certs\server.crt certs\ca.crt
+else
 	mkdir -p certs
 	openssl req -x509 -newkey rsa:4096 -keyout certs/server.key \
 	  -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
 	cp certs/server.crt certs/ca.crt
+endif
 
 # Build tests
 tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath bin/test_tls bin/test_ids bin/test_network_monitor
@@ -160,14 +170,23 @@ bin/test_network_monitor: tests/test_network_monitor.c $(OBJ_COMMON)
 
 # Clean build artifacts
 clean:
+ifeq ($(DETECTED_OS),Windows)
+	-$(RM) src\crypto\*.o src\tls\*.o src\engine\*.o src\transport\*.o src\security\*.o src\net\*.o src\server\*.o src\client\*.o
+	-$(RM) bin\*
+else
 	rm -f $(OBJ_COMMON) $(OBJ_SERVER) $(OBJ_CLIENT)
 	rm -f $(OBJ_PHASE1_COMMON) $(OBJ_PHASE1_SERVER) $(OBJ_PHASE1_CLIENT)
 	rm -f src/client/client_gui.o src/client/gtk_client.o
 	rm -f bin/server bin/client bin/client_gtk bin/server_phase1 bin/client_phase1 bin/test_*
+endif
 
 # Clean everything including certificates
 clean-all: clean
+ifeq ($(DETECTED_OS),Windows)
+	-$(RM) certs\*
+else
 	rm -rf certs/*
+endif
 
 # Install dependencies (for Ubuntu/Debian)
 install-deps:

@@ -40,7 +40,7 @@ typedef struct {
 
 /* E2EE Encrypted message payload */
 typedef struct {
-    char     sender[MAX_USERNAME_LEN];
+    char     sender[MAX_USERNAME_LEN * 2 + 2];
     uint8_t  nonce[12];                  /* 96-bit AES-GCM nonce */
     uint8_t  tag[16];                    /* 128-bit AES-GCM auth tag */
     uint8_t  dh_pubkey[32];              /* Ephemeral DR X25519 public key */

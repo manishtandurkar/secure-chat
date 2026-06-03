@@ -204,9 +204,9 @@ int test_payload_sizes(void) {
     }
     
     /* All padded messages should be MSG_PADDED_SIZE */
-    printf("    Message 1 (%2zu bytes) → %d bytes\n", strlen(messages[0]), MSG_PADDED_SIZE);
-    printf("    Message 2 (%2zu bytes) → %d bytes\n", strlen(messages[1]), MSG_PADDED_SIZE);
-    printf("    Message 3 (%2zu bytes) → %d bytes\n", strlen(messages[2]), MSG_PADDED_SIZE);
+    printf("    Message 1 (%2lu bytes) → %d bytes\n", (unsigned long)strlen(messages[0]), MSG_PADDED_SIZE);
+    printf("    Message 2 (%2lu bytes) → %d bytes\n", (unsigned long)strlen(messages[1]), MSG_PADDED_SIZE);
+    printf("    Message 3 (%2lu bytes) → %d bytes\n", (unsigned long)strlen(messages[2]), MSG_PADDED_SIZE);
     
     /* Verify unpadding recovers original */
     for (int i = 0; i < 3; i++) {

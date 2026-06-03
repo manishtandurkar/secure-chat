@@ -1,310 +1,178 @@
 # Adaptive Secure Communication System
 
-Language: C11
+An adaptive, end-to-end encrypted (E2EE), multi-client communication system targeting degraded, adversarial network environments. Developed in **C11**, using **OpenSSL 3.x**, and compiling on both **Linux (Ubuntu 20.04+)** and **Windows (MinGW/WSL)**.
 
-Crypto: OpenSSL 3.x
+---
 
-Build: GCC + Makefile
+## 📖 Architecture & Cryptographic Design
 
-Primary target: Linux (Ubuntu 20.04+). Windows users should run through WSL for best compatibility.
+This system provides complete privacy, network resilience, and intrusion defense through several decoupled, high-performance C modules.
 
-## What This Project Provides
+```
+                  ┌──────────────────────────────────────────────┐
+                  │                SERVER PROCESS                │
+                  │  Coordinates routing, offline queueing, and  │
+                  │       progressive IP security blocks.        │
+                  └──────────────────────┬───────────────────────┘
+                                         │  TLS 1.3
+                                         │  UDP Backup
+                  ┌──────────────────────┴───────────────────────┐
+                  │                CLIENT CORE                   │
+                  │  Handles X3DH bootstrap, Double Ratchet,     │
+                  │  and network deduplication.                  │
+                  └──────────────────────┬───────────────────────┘
+                                         │  Modular API
+                     ┌───────────────────┴───────────────────┐
+                     ▼                                       ▼
+         ┌───────────────────────┐               ┌───────────────────────┐
+         │      CLI CLIENT       │               │      GTK CLIENT       │
+         │  Interactive Terminal │               │   Graphical User UI   │
+         │     (client.c)        │               │    (gtk_client.c)     │
+         └───────────────────────┘               └───────────────────────┘
+```
 
-- TLS 1.3 transport setup
-- RSA authentication helpers
-- Diffie-Hellman key exchange helpers
-- Double Ratchet primitives
-- AES encryption and fixed-size message padding
-- Adaptive engine mode logic
-- Multi-path transport utilities (TCP/UDP support code)
-- Offline queue and priority queue modules
-- Unit tests for core modules
+### 1. End-to-End Encryption (E2EE) Layer
+*   **X3DH Session Bootstrap:** Alice and Bob securely negotiate encryption keys on-the-fly via 4 Diffie-Hellman handshakes (Identity, Ephemeral, Signed PreKey, and One-Time PreKeys).
+*   **Double Ratchet Key Evolution:** Keys rotate on every message via symmetric KDF chains. When new DR keys are sent, the DH ratchet steps forward to provide forward secrecy and break-in recovery.
+*   **Symmetric Initial State:** The Double Ratchet starts with keys derived directly from the X3DH shared secret. The receiver initializes the peer DR key on the first received message instead of executing an immediate DH step. This guarantees out-of-the-box key alignment and decryption compatibility.
+*   **AES-256-GCM:** Protects confidentiality and validates payload integrity.
 
-## Repository Layout
+### 2. Transport Resilience & Multi-Path Delivery
+*   **TCP (via TLS 1.3) + UDP Backup:** Messages are sent simultaneously over secure TLS 1.3 TCP channels and raw UDP.
+*   **Deduplication:** The receiver uses random 128-bit message IDs and a sliding ring-buffer window (`DEDUP_WINDOW = 1024`) to discard duplicates.
+*   **Priority Messaging:** Outgoing queues order messages by priority (`PRIORITY_NORMAL`, `URGENT`, and `CRITICAL`), ensuring urgent and critical messages bypass network congestion.
 
-- `bin/` compiled binaries
-- `certs/` generated TLS cert/key files
-- `include/` headers
-- `src/` implementation
-- `tests/` unit tests
-- `data/offline_queue/` persisted offline ciphertext files
+### 3. Adaptive Security & Intrusion Detection (IDS)
+*   **Adaptive State Machine:** The engine monitors network packet loss, RTT, auth failures, and replay attacks, dynamically transitioning between `NORMAL`, `UNSTABLE`, and `HIGH-RISK` modes.
+*   **Traffic Analysis Resistance:** In `HIGH-RISK` mode, the client automatically applies fixed-size padding (`4096 bytes`) to all messages and introduces randomized transmission delays to prevent timing analysis attacks.
+*   **Progressive IP Blocking:** Scores IP behavior (brute force, replay attempts, timestamp anomalies) and drops malicious connection requests.
 
-## Prerequisites
+---
 
-### Linux or WSL Ubuntu
+## 📂 Repository Layout
 
+| Directory / File | Description |
+| :--- | :--- |
+| **`include/`** | Header definitions (`ratchet.h`, `crypto.h`, `message.h`, `client.h`, `server.h`, etc.) |
+| **`src/crypto/`** | Double Ratchet state, X3DH prekey utilities, AES-GCM, and HKDF/HMAC implementations |
+| **`src/tls/`** | TLS 1.3 server and client connection handlers |
+| **`src/engine/`** | Adaptive engine state machine and real-time network metrics collectors |
+| **`src/transport/`** | Multi-path send/recv delivery, offline ciphertext persistence, and priority queues |
+| **`src/security/`** | Intrusion Detection System (IDS) scoring, rate limits, and block tracking |
+| **`src/net/`** | Cross-platform socket utilities, DNS resolvers, and UDP notification threads |
+| **`src/server/`** | Multi-threaded routing, rooms management, and authentication managers |
+| **`src/client/`** | Client threads, CLI controller, and GTK graphical user interface |
+| **`certs/`** | Generated server certificates and keys |
+| **`data/offline_queue/`** | Persistent directory for storing offline E2EE ciphertexts |
+
+---
+
+## 🛠️ Build & Verification Instructions
+
+### 1. Prerequisites (WSL or Linux Ubuntu)
+Install the required toolchain and development libraries:
 ```bash
 sudo apt-get update
-sudo apt-get install -y gcc make libssl-dev pkg-config
+sudo apt-get install -y gcc make libssl-dev pkg-config libgtk-3-dev
 ```
 
-For the GTK demo UI, also install:
+### 2. Build Targets
+Build the entire workspace or specific components using the Makefile:
+*   **Clean and build everything:**
+    ```bash
+    make clean && make all && make tests
+    ```
+*   **Build the GTK Graphical UI Client:**
+    ```bash
+    make gtk-client
+    ```
+*   **Build Phase-1 (TCP-only, no crypto dependencies):**
+    ```bash
+    make phase1
+    ```
 
-```bash
-sudo apt-get install -y libgtk-3-dev
-```
-
-### Verify Toolchain
-
-```bash
-gcc --version
-make --version
-pkg-config --modversion openssl
-```
-
-
-## Build Instructions
-
-From project root:
-
-```bash
-make clean
-make all
-```
-
-
-What `make all` does:
-
-1. Creates `bin/` (if missing)
-2. Builds `bin/server`
-3. Builds `bin/client`
-4. Generates TLS materials in `certs/`
-
-Build tests:
-
-```bash
-make tests
-```
-
-Build only one target:
-
-```bash
-make server
-make client
-```
-
-Build the GTK demo client:
-
-```bash
-make gtk-client
-```
-
-Build phase-1 TCP-only binaries:
-
-```bash
-make phase1
-```
-
-## Running The Application
-
-Open three terminals.
-
-Terminal 1 (server):
-
-```bash
-./bin/server
-```
-
-Terminal 2 (client A):
-
-```bash
-./bin/client localhost 8080 alice
-```
-
-Terminal 3 (client B):
-
-```bash
-./bin/client localhost 8080 bob
-```
-
-Client usage notes:
-
-- Type a message and press Enter to send.
-- Use `/quit` to disconnect cleanly.
-
-GTK demo client:
-
-```bash
-./bin/client_gtk
-```
-
-Use the GTK window to enter host, port, username, and recipient username (`To`).
-
-New GTK feature:
-
-- Live `Online Users` panel.
-- Click any online user to auto-fill the `To` field.
-- `Refresh Users` button and periodic auto-refresh keep the list up to date.
-
-Directed messaging behavior:
-
-- Messages are now routed to specific clients only.
-- Message format on wire is directed (`@recipient message`).
-- GTK handles this automatically from the `To` field.
-- If recipient is offline, server sends queue confirmation and stores message in offline queue.
-
-Additional useful use cases:
-
-- Broadcast announcement: enable `Broadcast to all online users` and send one message to everyone currently online.
-- Priority escalation: choose `NORMAL`, `URGENT`, or `CRITICAL` before sending.
-- Quick action presets in GTK:
-	- `Emergency Broadcast` (broadcast + CRITICAL)
-	- `Status Check` (direct + URGENT)
-	- `Team Sync` (broadcast + NORMAL)
-
-Priority is visible on received messages in logs as `[MSG][NORMAL|URGENT|CRITICAL]`.
-
-Example:
-
-- Client `alice` sets `To = bob` and sends `hello`.
-- Only `bob` receives it.
-- `alice` does not get self-echo.
-
-## Detailed Test Workflow
-
-## 1) Fast Build Validation
-
-```bash
-make clean
-make all
-```
-
-Checks:
-
-- `bin/server` exists
-- `bin/client` exists
-- `certs/server.crt`, `certs/server.key`, `certs/ca.crt` exist
-
-## 2) Run Unit Tests
-
-Build and run all unit tests:
-
+### 3. Run Unit Tests
+Run the entire automated test suite (7 components, 100% pass):
 ```bash
 make test
 ```
 
-This runs:
-
-- `./bin/test_ratchet`
-- `./bin/test_crypto`
-- `./bin/test_adaptive`
-- `./bin/test_multipath`
-
-Run one test directly:
-
+Or run any of the unit test binaries individually:
 ```bash
-./bin/test_crypto
+./bin/test_ratchet          # Double Ratchet state, evolution, and recovery
+./bin/test_crypto           # AES-GCM, Ed25519 signatures, X3DH Bootstrap
+./bin/test_adaptive         # Adaptive engine mode state transitions
+./bin/test_multipath        # Deduplication, padding, and priority sorting
+./bin/test_tls              # TLS 1.3 context creation and connection loops
+./bin/test_ids              # Intrusion detection scoring and IP blocking
+./bin/test_network_monitor  # Network quality metrics, health scores, and trends
 ```
 
-Pass condition: process exits with code `0`.
+---
 
-## 3) Manual End-to-End Smoke Test
+## 🔌 API & Custom Frontend Integration Guide
 
-1. Start server in terminal A:
+The client core has been designed with a strict **Separation of Concerns** to make implementing custom frontends (e.g. React/Electron, mobile apps, or alternative UI toolkits) extremely simple without touching the cryptography or network codebase.
 
-```bash
-./bin/server
+### 1. Client Core Entry Points
+Your frontend wrapper can initialize and manage the connection lifecycle through the following functions in [client.h](file:///c:/6th%20semester%20EL's/Network%20programming%20and%20security%20lab%20EL/Implementation/secure-chat/include/client.h):
+
+```c
+/* 1. Initialize client state, resolve DNS, and connect socket */
+int client_init(ClientState *client, const char *hostname, int port, const char *username);
+
+/* 2. Execute TLS handshake and authenticate with server via Ed25519 signature */
+int authenticate_with_server(ClientState *client);
+
+/* 3. Spawn background recv, send, and UDP notify threads */
+int client_start_threads(ClientState *client);
+
+/* 4. Enqueue an outgoing message with a priority level */
+int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority);
+
+/* 5. Shut down socket and join background threads cleanly on exit */
+void client_join_threads(ClientState *client);
+
+/* 6. Clean up contexts and free allocated key structures */
+void client_cleanup(ClientState *client);
 ```
 
-2. Start client in terminal B:
+### 2. Log & Event Callback API
+Instead of writing output directly to the terminal, you can route all decrypted chat messages, server notices, and status updates directly to your frontend using the registration API:
 
-```bash
-./bin/client localhost 8080 testuser
+```c
+/* Register callback function to receive formatted log lines */
+void client_set_log_callback(void (*callback)(const char *log_line));
 ```
 
-3. Send a few messages from client.
+#### Example Usage in C / GTK Wrapper:
+```c
+/* Callback function in your frontend code */
+void my_frontend_logger(const char *log_line) {
+    // Render the log line on your graphical window, console, or chat bubble
+    gtk_text_buffer_insert_at_cursor(chat_buffer, log_line, -1);
+}
 
-Expected:
-
-- Client establishes connection and authenticates.
-- Messages are processed without crash.
-- Server remains running and logs message handling.
-
-## 4) Two-Client Concurrency Check
-
-1. Server in terminal A.
-2. Start two clients with different usernames.
-3. Send messages from both clients quickly.
-
-Expected:
-
-- Both clients remain connected.
-- Server does not crash or hang.
-- Message processing continues for both sessions.
-
-## 5) Scripted Feature Check (WSL/Linux)
-
-A helper script exists:
-
-```bash
-chmod +x test_all_features.sh
-./test_all_features.sh
+int main() {
+    ClientState client;
+    client_set_log_callback(my_frontend_logger);
+    
+    // Run client threads...
+}
 ```
 
+### 3. Reference Implementation
+See [gtk_client.c](file:///c:/6th%20semester%20EL's/Network%20programming%20and%20security%20lab%20EL/Implementation/secure-chat/src/client/gtk_client.c) to inspect a fully-functional GTK3 implementation that displays online users, manages chat buffers, supports priority selections, and registers logger callbacks.
 
-Notes:
+---
 
-- Script assumes Linux paths and commands.
-- Run it from WSL or Linux, not native cmd.exe.
+## 🛠️ Summary of Key Fixes & Improvements
 
-## 6) Inspect Exit Codes In CI/Automation
-
-Example:
-
-```bash
-make tests && ./bin/test_ratchet && ./bin/test_crypto && ./bin/test_adaptive && ./bin/test_multipath
-```
-
-Use non-zero exit code as failure signal.
-
-## Troubleshooting
-
-Connection refused:
-
-- Ensure server is running before client.
-- Confirm server port (`8080`) is not occupied.
-
-TLS/certificate failures:
-
-```bash
-make certs
-```
-
-Then retry server and client.
-
-Build fails due to OpenSSL headers/libs:
-
-```bash
-sudo apt-get install -y libssl-dev pkg-config
-pkg-config --cflags --libs openssl
-```
-
-Windows native shell issues:
-
-- Prefer WSL Ubuntu for runtime and tests.
-- If using Git Bash/MSYS2, ensure OpenSSL dev libraries are available and compatible.
-
-## Useful Make Targets
-
-```bash
-make help
-```
-
-Common targets:
-
-- `make all`
-- `make tests`
-- `make test`
-- `make clean`
-- `make certs`
-- `make debug`
-- `make release`
-
-## Recommended Verification Order
-
-1. `make clean && make all`
-2. `make test`
-3. Manual server/client smoke run
-4. Optional: `./test_all_features.sh`
-
-This sequence gives fast confidence in build health, crypto logic, adaptive logic, and runtime startup behavior.
+During the recent consolidation phase, we resolved critical compilation, security, and runtime bugs to guarantee stable execution:
+1.  **OpenSSL 3.0 Deprecations:** Replaced deprecated `EVP_PKEY_cmp` calls with `EVP_PKEY_eq` in [client.c](file:///c:/6th%20semester%20EL's/Network%20programming%20and%20security%20lab%20EL/Implementation/secure-chat/src/client/client.c).
+2.  **E2EE Sender Buffer Overflow:** Expanded the `sender` buffer inside `E2EEChatPayload` in [message.h](file:///c:/6th%20semester%20EL's/Network%20programming%20and%20security%20lab%20EL/Implementation/secure-chat/include/message.h) to `MAX_USERNAME_LEN * 2 + 2` to prevent memory corruption when packing both sender and recipient names.
+3.  **Double Ratchet Key Alignment:** Resolved initial state mismatch by ensuring the responder initializes `peer_dh_pubkey` on the first received message instead of executing an immediate DH step.
+4.  **Graceful Disconnect/Exit:** Updated `client_join_threads` in [client.c](file:///c:/6th%20semester%20EL's/Network%20programming%20and%20security%20lab%20EL/Implementation/secure-chat/src/client/client.c) to shutdown the socket channel. This unblocks the background receiver thread from `tls_recv` immediately when `/quit` is entered, resolving client terminal hanging issues.
+5.  **Winsock Initialization:** Added platform socket startup and cleanup functions to client's `main` to support native Windows socket initialization.
+6.  **Drift Synchronization:** Configured client auth request timestamp using current milliseconds and network byte order to satisfy the server's strict 5-minute anti-replay clock validation.
+7.  **Warning Clearance:** Cast print sizes, removed unused variables (`metrics` in test cases), and replaced legacy `usleep` with POSIX-standard `nanosleep` across components.

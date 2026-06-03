@@ -130,9 +130,17 @@ int multipath_send(SSL *ssl, int udp_fd,
         /* Apply delay based on engine config */
         if (engine->random_delay) {
             int delay_ms = 100 + (rand() % 400); /* 100–500ms */
-            usleep(delay_ms * 1000);
+            struct timespec req = {
+                .tv_sec = delay_ms / 1000,
+                .tv_nsec = (delay_ms % 1000) * 1000000
+            };
+            nanosleep(&req, NULL);
         } else {
-            usleep(engine->retry_delay_ms * 1000);
+            struct timespec req = {
+                .tv_sec = engine->retry_delay_ms / 1000,
+                .tv_nsec = (engine->retry_delay_ms % 1000) * 1000000
+            };
+            nanosleep(&req, NULL);
         }
     }
     
@@ -148,6 +156,7 @@ int multipath_recv(SSL *ssl, int udp_fd,
                    void *payload_out, size_t buf_len,
                    uint8_t *msg_id_out) {
     /* Simplified implementation - in production would use select/poll */
+    (void)udp_fd;
     if (!ssl || !payload_out) {
         return ERROR_NETWORK;
     }

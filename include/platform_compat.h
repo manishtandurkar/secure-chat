@@ -10,6 +10,15 @@
 #ifndef PLATFORM_COMPAT_H
 #define PLATFORM_COMPAT_H
 
+#if !defined(_WIN32) && !defined(_WIN64)
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 /* ===================================================================
  * Platform Detection
  * =================================================================== */
@@ -169,6 +178,7 @@ static inline int platform_set_nonblocking(socket_t sockfd) {
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <endian.h>
 
 /* Socket type mapping */
 typedef int socket_t;

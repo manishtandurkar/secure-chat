@@ -70,7 +70,7 @@ int udp_notify_send(int sockfd, const UdpNotification *notif,
         return -1;
     }
     
-    ssize_t sent = sendto(sockfd, notif, sizeof(UdpNotification), 0,
+    ssize_t sent = sendto(sockfd, (const char *)notif, sizeof(UdpNotification), 0,
                          (struct sockaddr *)dest, sizeof(*dest));
     
     return (sent == sizeof(UdpNotification)) ? 0 : -1;
@@ -85,7 +85,7 @@ int udp_notify_recv(int sockfd, UdpNotification *notif_out,
     
     socklen_t addr_len = sizeof(*sender_out);
     
-    ssize_t received = recvfrom(sockfd, notif_out, sizeof(UdpNotification), 0,
+    ssize_t received = recvfrom(sockfd, (char *)notif_out, sizeof(UdpNotification), 0,
                                (struct sockaddr *)sender_out, &addr_len);
     
     return (received == sizeof(UdpNotification)) ? 0 : -1;

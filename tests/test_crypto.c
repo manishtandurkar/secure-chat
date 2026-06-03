@@ -85,7 +85,7 @@ int test_aes_encrypt_decrypt(void) {
         return 0;
     }
     
-    printf("    Plaintext:  %zu bytes\n", strlen(plaintext));
+    printf("    Plaintext:  %lu bytes\n", (unsigned long)strlen(plaintext));
     printf("    Ciphertext: %d bytes\n", ct_len);
     printf("    GCM Tag:    16 bytes\n");
     

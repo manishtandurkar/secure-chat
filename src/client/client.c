@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <time.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -236,6 +237,10 @@ int authenticate_with_server(ClientState *client) {
     memset(&auth_req, 0, sizeof(AuthRequest));
     strncpy(auth_req.username, client->username, MAX_USERNAME_LEN - 1);
     
+    time_t now = time(NULL);
+    uint64_t timestamp_ms = (uint64_t)now * 1000;
+    auth_req.timestamp = htobe64(timestamp_ms);
+    
     size_t sig_len = 64;
     if (ed25519_sign(client->identity_keypair, challenge, 32, auth_req.signature, &sig_len) != SUCCESS || sig_len != 64) {
         fprintf(stderr, "Failed to compute Ed25519 auth signature\n");
@@ -382,8 +387,11 @@ void *recv_thread_func(void *arg) {
             /* Step ephemeral DR key using incoming ephemeral DR public key if new */
             EVP_PKEY *incoming_dh = dh_pubkey_from_bytes(chat_payload.dh_pubkey, 32);
             if (incoming_dh) {
-                if (!client->ratchet.peer_dh_pubkey || 
-                    EVP_PKEY_cmp(client->ratchet.peer_dh_pubkey, incoming_dh) != 1) {
+                if (!client->ratchet.peer_dh_pubkey) {
+                    /* Initial DR key received: set it without stepping the DH ratchet */
+                    client->ratchet.peer_dh_pubkey = incoming_dh;
+                    EVP_PKEY_up_ref(incoming_dh);
+                } else if (EVP_PKEY_eq(client->ratchet.peer_dh_pubkey, incoming_dh) != 1) {
                     ratchet_dh_step(&client->ratchet, incoming_dh);
                 }
                 EVP_PKEY_free(incoming_dh);
@@ -514,6 +522,13 @@ int client_start_threads(ClientState *client) {
 }
 
 void client_join_threads(ClientState *client) {
+    if (client->tcp_socket >= 0) {
+#ifdef PLATFORM_WINDOWS
+        shutdown(client->tcp_socket, SD_BOTH);
+#else
+        shutdown(client->tcp_socket, SHUT_RDWR);
+#endif
+    }
     pthread_join(client->recv_thread, NULL);
     pthread_join(client->send_thread, NULL);
 }
@@ -642,6 +657,7 @@ int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint
             pthread_mutex_unlock(&client->ratchet_lock);
             return -1;
         }
+
 
         /* Cache public X3DH keys in Alice's global session cache */
         size_t id_pub_len = 32, ephem_pub_len = 32;
@@ -772,19 +788,27 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_shutdown);
     signal(SIGTERM, handle_shutdown);
 
+    if (platform_socket_init() != 0) {
+        fprintf(stderr, "Failed to initialize socket platform\n");
+        return 1;
+    }
+
     if (tls_init() != SUCCESS) {
         fprintf(stderr, "Failed to initialize OpenSSL\n");
+        platform_socket_cleanup();
         return 1;
     }
 
     if (client_init(&client, hostname, port, username) != 0) {
         fprintf(stderr, "Client initialization failed\n");
+        platform_socket_cleanup();
         return 1;
     }
 
     if (authenticate_with_server(&client) != 0) {
         fprintf(stderr, "Authentication failed\n");
         client_cleanup(&client);
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -794,6 +818,7 @@ int main(int argc, char *argv[]) {
     if (client_start_threads(&client) != 0) {
         fprintf(stderr, "Failed to start threads\n");
         client_cleanup(&client);
+        platform_socket_cleanup();
         return 1;
     }
 
@@ -801,6 +826,7 @@ int main(int argc, char *argv[]) {
 
     printf("\nDisconnecting...\n");
     client_cleanup(&client);
+    platform_socket_cleanup();
     return 0;
 }
 #endif

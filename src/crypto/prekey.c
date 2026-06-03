@@ -129,7 +129,7 @@ int prekey_compute_x3dh_initiator(EVP_PKEY *alice_identity_key,
 
     /* DH4 = Alice Ephemeral + Bob OTPK (if applicable) */
     EVP_PKEY *bob_otpk_pub = NULL;
-    int concat_len = 92;
+    int concat_len = 96;
     if (use_otpk && bob_bundle->otpk_count > 0) {
         bob_otpk_pub = dh_pubkey_from_bytes(bob_bundle->otpk_pub[0], 32);
         if (!bob_otpk_pub) goto err;
