@@ -195,6 +195,8 @@ int client_init(ClientState *client, const char *hostname, int port, const char 
     memset(client->dedup_set, 0, sizeof(client->dedup_set));
     client->dedup_idx = 0;
     client->dh_ratchet_freq = 10;
+    client->has_pending_prekey = 0;
+    pthread_cond_init(&client->prekey_cond, NULL);
 
     return 0;
 }
@@ -440,6 +442,18 @@ void *recv_thread_func(void *arg) {
                 fflush(stdout);
             }
 
+        } else if (hdr.msg_type == MSG_PREKEY_RESP) {
+            uint32_t payload_len = ntohl(hdr.payload_len);
+            if (payload_len == sizeof(PreKeyBundle)) {
+                PreKeyBundle bundle;
+                if (tls_recv(client->ssl, &bundle, sizeof(PreKeyBundle)) == sizeof(PreKeyBundle)) {
+                    pthread_mutex_lock(&client->ratchet_lock);
+                    client->pending_prekey = bundle;
+                    client->has_pending_prekey = 1;
+                    pthread_cond_signal(&client->prekey_cond);
+                    pthread_mutex_unlock(&client->ratchet_lock);
+                }
+            }
         } else if (hdr.msg_type == MSG_ERROR || hdr.msg_type == MSG_OFFLINE_STORED || hdr.msg_type == MSG_USER_LIST_RESP) {
             uint32_t payload_len = ntohl(hdr.payload_len);
             if (payload_len > 0 && payload_len < 4096) {
@@ -450,6 +464,13 @@ void *recv_thread_func(void *arg) {
                                     : (hdr.msg_type == MSG_OFFLINE_STORED) ? "QUEUE"
                                     : "USERS";
                     client_log_format("[%s] %s", tag, (char *)msg);
+                    
+                    if (hdr.msg_type == MSG_ERROR) {
+                        pthread_mutex_lock(&client->ratchet_lock);
+                        client->has_pending_prekey = -1;
+                        pthread_cond_signal(&client->prekey_cond);
+                        pthread_mutex_unlock(&client->ratchet_lock);
+                    }
                 }
                 free(msg);
             }
@@ -522,6 +543,7 @@ int client_start_threads(ClientState *client) {
 }
 
 void client_join_threads(ClientState *client) {
+    pthread_join(client->send_thread, NULL);
     if (client->tcp_socket >= 0) {
 #ifdef PLATFORM_WINDOWS
         shutdown(client->tcp_socket, SD_BOTH);
@@ -530,7 +552,6 @@ void client_join_threads(ClientState *client) {
 #endif
     }
     pthread_join(client->recv_thread, NULL);
-    pthread_join(client->send_thread, NULL);
 }
 
 void client_cleanup(ClientState *client) {
@@ -570,6 +591,7 @@ void client_cleanup(ClientState *client) {
     save_ratchet_state(client);
     ratchet_destroy(&client->ratchet);
     pthread_mutex_destroy(&client->ratchet_lock);
+    pthread_cond_destroy(&client->prekey_cond);
 }
 
 int save_ratchet_state(ClientState *client) {
@@ -620,26 +642,31 @@ int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint
             .checksum = 0
         };
         generate_random_bytes(req_hdr.msg_id, MSG_ID_LEN);
+        client->has_pending_prekey = 0;
         tls_send(client->ssl, &req_hdr, sizeof(req_hdr));
         tls_send(client->ssl, recipient, (int)strlen(recipient));
 
-        /* Read Bob's PreKey Bundle */
-        MsgHeader resp_hdr;
-        if (tls_recv(client->ssl, &resp_hdr, sizeof(resp_hdr)) != sizeof(resp_hdr)) {
+        /* Wait for PreKey response from recv_thread */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5; // 5 seconds timeout
+
+        while (client->has_pending_prekey == 0) {
+            int cond_res = pthread_cond_timedwait(&client->prekey_cond, &client->ratchet_lock, &ts);
+            if (cond_res != 0) {
+                pthread_mutex_unlock(&client->ratchet_lock);
+                return -1;
+            }
+        }
+
+        if (client->has_pending_prekey == -1) {
+            client->has_pending_prekey = 0;
             pthread_mutex_unlock(&client->ratchet_lock);
             return -1;
         }
 
-        if (resp_hdr.msg_type != MSG_PREKEY_RESP) {
-            pthread_mutex_unlock(&client->ratchet_lock);
-            return -1;
-        }
-
-        PreKeyBundle bobs_bundle;
-        if (tls_recv(client->ssl, &bobs_bundle, sizeof(PreKeyBundle)) != sizeof(PreKeyBundle)) {
-            pthread_mutex_unlock(&client->ratchet_lock);
-            return -1;
-        }
+        PreKeyBundle bobs_bundle = client->pending_prekey;
+        client->has_pending_prekey = 0;
 
         /* Generate Alice ephemeral key and derive root key via X3DH */
         EVP_PKEY *alice_ephem = dh_generate_keypair();

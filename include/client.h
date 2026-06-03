@@ -6,6 +6,7 @@
 #include "tls_layer.h"
 #include "ratchet.h"
 #include "priority_queue.h"
+#include "prekey.h"
 #include <pthread.h>
 #include <openssl/evp.h>
 
@@ -31,6 +32,9 @@ typedef struct {
     int dedup_idx;
     pthread_mutex_t ratchet_lock;
     int dh_ratchet_freq; /* Messages between DH ratchet steps (from engine, default 10) */
+    PreKeyBundle pending_prekey;
+    int has_pending_prekey;
+    pthread_cond_t prekey_cond;
 } ClientState;
 
 typedef void (*ClientLogCallback)(const char *line, void *user_data);
