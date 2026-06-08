@@ -5,9 +5,7 @@
 **Linux (Ubuntu 20.04+) required.** If on Windows, use WSL (Ubuntu).
 
 ```bash
-sudo apt-get install -y gcc make libssl-dev pkg-config
-# Optional GTK client:
-sudo apt-get install -y libgtk-3-dev
+sudo apt-get install -y gcc make libssl-dev pkg-config libgtk-3-dev
 ```
 
 ---
@@ -18,8 +16,9 @@ sudo apt-get install -y libgtk-3-dev
 # One-time setup
 mkdir -p bin data/offline_queue data/keys
 
-# Build server and client
-make all
+# Build everything
+make all          # server + CLI client
+make gtk-client   # GTK GUI client
 
 # Generate TLS certificates (self-signed, valid 365 days)
 make certs
@@ -27,7 +26,7 @@ make certs
 
 ---
 
-## Run
+## Run — GTK GUI Client (Recommended)
 
 Open three terminals (or WSL panes):
 
@@ -36,23 +35,46 @@ Open three terminals (or WSL panes):
 ./bin/server
 ```
 
-**Terminal 2 — Alice:**
+**Terminal 2 — First user:**
+```bash
+./bin/client_gtk
+```
+
+**Terminal 3 — Second user:**
+```bash
+./bin/client_gtk
+```
+
+In each login dialog, enter `localhost`, port `8080`, and a unique username, then click **Connect**.
+
+---
+
+## GTK GUI Features
+
+| Feature | Description |
+|---------|-------------|
+| Login dialog | Enter host/port/username; duplicate usernames are rejected with an error |
+| To dropdown | Checkbox list of online users; tick one or more; use **Everyone (All)** to broadcast |
+| Offline user entry | Type any username directly in the field next to the dropdown (works for offline users too) |
+| Priority | Radio buttons: Normal / Urgent / Critical; resets to Normal after each send |
+| Online Users panel | Live list on the right — updates instantly when anyone connects or disconnects |
+| Chat formatting | Timestamps (gray), sender name (green=self, blue=others), orange/red for priority messages |
+| Offline queue feedback | Sender sees `── Message queued for offline user: bob ──`; receiver sees `[queued]` badge |
+| Sent message echo | Your own messages appear in your chat view immediately after sending |
+
+---
+
+## Run — CLI Client
+
 ```bash
 ./bin/client localhost 8080 alice
 ```
 
-**Terminal 3 — Bob:**
-```bash
-./bin/client localhost 8080 bob
-```
-
----
-
-## Message Syntax
+### Message Syntax
 
 | Input | Effect |
 |-------|--------|
-| `@bob Hello!` | Send directed message to bob |
+| `@bob Hello!` | Directed message to bob |
 | `@all Broadcast` | Send to all connected users |
 | `!urgent @bob Emergency` | Urgent priority send to bob |
 | `!critical @all SOS` | Critical priority broadcast |
@@ -62,18 +84,33 @@ Open three terminals (or WSL panes):
 
 ---
 
-## GTK GUI Client (optional)
+## Offline Queue Demo
 
-```bash
-make gtk-client
-./bin/client_gtk localhost 8080 alice
+1. Start server and connect as alice
+2. In alice's **To** field, type `bob` (who is not connected)
+3. Send a message — alice sees `── Message queued for offline user: bob ──`
+4. Connect as bob — queued message is delivered immediately with a `[queued]` badge
+
+---
+
+## Crypto Verbose Logging
+
+Enabled by default. Both server and clients print E2EE layer details to stderr:
+
+```
+[CLIENT-SEND] E2EE encrypt:
+[CLIENT-SEND]   Plaintext:  "bob\nhello"
+[CLIENT-SEND]   Ciphertext: a3f8c2d1e047b9...[528 bytes total]
+
+[SERVER] MSG_CHAT from 'alice' — E2EE layer:
+[SERVER]   Ciphertext (gibberish): a3f8c2d1e047b9...[528 bytes total]
+[SERVER]   Decrypted plaintext: "bob\nhello"
+
+[CLIENT-RECV]   Ciphertext: 5d8e2a1f349c88...
+[CLIENT-RECV]   Decrypted:  "alice\nhello"
 ```
 
-Features:
-- Online users panel (click to fill recipient)
-- Broadcast toggle
-- Priority selector
-- Connect form
+Note: the ciphertext on the send side and on the server side use **different keys** (Double Ratchet re-encrypts for each recipient).
 
 ---
 
@@ -122,8 +159,7 @@ Security:    IDS per-IP blocking + Adaptive Engine
 - Message payloads are always padded to 4096 bytes (traffic analysis resistance)
 - Key material is zeroed with `OPENSSL_cleanse()` after use
 - Offline queue files: `0600`, directories: `0700`
-- Ratchet state files: `~/.aschat/<username>.ratchet` with `0600`
-- Usernames restricted to `[a-zA-Z0-9_-]`
+- Usernames restricted to `[a-zA-Z0-9_-]`, must be unique per session
 
 ---
 
@@ -133,6 +169,8 @@ Security:    IDS per-IP blocking + Adaptive Engine
 |---------|-----|
 | `Connection refused` | Start `./bin/server` first |
 | `TLS error` | Run `make certs` to regenerate certificates |
+| `Username already in use` | Choose a different username — duplicates are rejected |
 | `Auth failed` | Each client generates a fresh RSA keypair on first connect |
 | Build error: `openssl/ssl.h not found` | `sudo apt-get install libssl-dev` |
-| Build error: `clock_gettime` | Ensure `gcc` and `make` use `-D_POSIX_C_SOURCE=200809L` (already in Makefile) |
+| Build error: `gtk/gtk.h not found` | `sudo apt-get install libgtk-3-dev` |
+| Online Users panel empty | Wait a moment — server pushes list on connect; click Refresh if needed |
