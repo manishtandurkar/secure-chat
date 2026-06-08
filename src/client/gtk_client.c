@@ -1,522 +1,617 @@
-#define _POSIX_C_SOURCE 200809L
+/*
+ * GTK3 GUI client — requires libgtk-3-dev
+ * Build: make gtk-client   Run: ./bin/client_gtk
+ */
+#ifdef HAVE_GTK
 
 #include <gtk/gtk.h>
-#include "client.h"
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 #include <pthread.h>
+#include "client.h"
+#include "priority_queue.h"
+#include "message.h"
+#include "common.h"
+#include "platform_compat.h"
 
-typedef struct {
-    GtkWidget *window;
-    GtkWidget *host_entry;
-    GtkWidget *port_entry;
-    GtkWidget *username_entry;
-    GtkWidget *recipient_entry;
-    GtkWidget *message_entry;
-    GtkWidget *priority_combo;
-    GtkWidget *broadcast_check;
-    GtkWidget *connect_button;
-    GtkWidget *send_button;
-    GtkWidget *status_label;
-    GtkWidget *log_view;
-    GtkTextBuffer *log_buffer;
-    GtkWidget *users_listbox;
-    GtkWidget *refresh_users_button;
-    GtkWidget *users_count_label;
-    ClientState client;
-    gboolean connected;
-} GtkClientApp;
+/* ── Globals ──────────────────────────────────────────────────── */
+static ClientContext g_ctx             = {0};
+static GtkWidget    *g_window          = NULL;
+static GtkWidget    *g_text_view       = NULL;
+static GtkWidget    *g_entry           = NULL;
+static GtkWidget    *g_to_button       = NULL;
+static GtkWidget    *g_all_check       = NULL;
+static GtkWidget    *g_users_check_box = NULL;
+static GtkWidget    *g_users_list      = NULL;
+static GtkWidget    *g_status_bar      = NULL;
+static GtkWidget    *g_radio_normal    = NULL;
+static GtkWidget    *g_radio_urgent    = NULL;
+static GtkWidget    *g_radio_critical  = NULL;
+static GtkWidget    *g_to_hint         = NULL;
+static GtkWidget    *g_direct_entry    = NULL;  /* manual offline username entry */
 
-typedef struct {
-    GtkClientApp *app;
-    char *line;
-} LogEvent;
-
-static void scroll_log_to_end(GtkTextView *view);
-static gboolean request_user_list_timer(gpointer data);
-
-static void clear_users_list(GtkClientApp *app) {
-    GList *children = gtk_container_get_children(GTK_CONTAINER(app->users_listbox));
-    for (GList *it = children; it != NULL; it = it->next) {
-        gtk_widget_destroy(GTK_WIDGET(it->data));
-    }
-    g_list_free(children);
+/* ── Helpers ──────────────────────────────────────────────────── */
+static gboolean on_delete_event(GtkWidget *w, GdkEvent *e, gpointer d) {
+    (void)w; (void)e; (void)d;
+    gtk_main_quit();
+    return FALSE;
 }
 
-static void update_users_count(GtkClientApp *app, int count) {
-    char text[64];
-    snprintf(text, sizeof(text), "Online users: %d", count);
-    gtk_label_set_text(GTK_LABEL(app->users_count_label), text);
+/* ── Chat text view ───────────────────────────────────────────── */
+static void chat_scroll_to_bottom(void) {
+    GtkAdjustment *adj = gtk_scrolled_window_get_vadjustment(
+        GTK_SCROLLED_WINDOW(gtk_widget_get_parent(g_text_view)));
+    gtk_adjustment_set_value(adj, gtk_adjustment_get_upper(adj));
 }
 
-static void on_user_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
-    (void)box;
-    GtkClientApp *app = (GtkClientApp *)user_data;
-    if (!row) {
-        return;
-    }
-
-    GtkWidget *child = gtk_bin_get_child(GTK_BIN(row));
-    if (!GTK_IS_LABEL(child)) {
-        return;
-    }
-
-    const char *username = gtk_label_get_text(GTK_LABEL(child));
-    if (username && strlen(username) > 0) {
-        gtk_entry_set_text(GTK_ENTRY(app->recipient_entry), username);
-    }
+/* Append a chat line with rich formatting (must run on GTK main thread) */
+/* Append a gray italic system notice: ── text ── */
+static void chat_system(const char *msg) {
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_text_view));
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+    char line[512];
+    snprintf(line, sizeof(line), "── %s ──\n", msg);
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, line, -1, "sys", NULL);
+    chat_scroll_to_bottom();
 }
 
-static void populate_users_list(GtkClientApp *app, const char *csv_users) {
-    clear_users_list(app);
-
-    if (!csv_users || strlen(csv_users) == 0) {
-        update_users_count(app, 0);
-        return;
-    }
-
-    char *copy = g_strdup(csv_users);
-    if (!copy) {
-        return;
-    }
-
-    int count = 0;
-    char *token = strtok(copy, ",");
-    while (token) {
-        while (*token == ' ') {
-            token++;
-        }
-        if (*token != '\0') {
-            GtkWidget *row_label = gtk_label_new(token);
-            gtk_widget_set_halign(row_label, GTK_ALIGN_START);
-            gtk_list_box_insert(GTK_LIST_BOX(app->users_listbox), row_label, -1);
-            count++;
-        }
-        token = strtok(NULL, ",");
-    }
-
-    g_free(copy);
-    gtk_widget_show_all(app->users_listbox);
-    update_users_count(app, count);
-}
-
-static void append_log_line(GtkClientApp *app, const char *line) {
-    GtkTextIter end_iter;
-    gtk_text_buffer_get_end_iter(app->log_buffer, &end_iter);
-    gtk_text_buffer_insert(app->log_buffer, &end_iter, line, -1);
-    gtk_text_buffer_insert(app->log_buffer, &end_iter, "\n", -1);
-}
-
-static gboolean append_log_idle(gpointer data) {
-    LogEvent *event = (LogEvent *)data;
-
-    if (strncmp(event->line, "[USERS] ", 8) == 0) {
-        populate_users_list(event->app, event->line + 8);
-    }
-
-    append_log_line(event->app, event->line);
-    scroll_log_to_end(GTK_TEXT_VIEW(event->app->log_view));
-    g_free(event->line);
-    g_free(event);
+static gboolean system_idle(gpointer data) {
+    chat_system((char *)data);
+    g_free(data);
     return G_SOURCE_REMOVE;
 }
 
-static void gtk_log_callback(const char *line, void *user_data) {
-    LogEvent *event = g_malloc(sizeof(*event));
-    event->app = (GtkClientApp *)user_data;
-    event->line = g_strdup(line);
-    g_idle_add(append_log_idle, event);
+static void on_system_cb(const char *msg) {
+    gdk_threads_add_idle(system_idle, g_strdup(msg));
 }
 
-static void set_status(GtkClientApp *app, const char *status) {
-    gtk_label_set_text(GTK_LABEL(app->status_label), status);
-    append_log_line(app, status);
-    scroll_log_to_end(GTK_TEXT_VIEW(app->log_view));
-}
+static void chat_append(const char *sender, const char *text,
+                        uint8_t priority, uint8_t flags, gboolean is_self) {
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_text_view));
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
 
-static void pump_events(void) {
-    while (gtk_events_pending()) {
-        gtk_main_iteration();
+    /* Mark the line start — iters are invalidated by insertions, marks are not */
+    GtkTextMark *line_mark = gtk_text_buffer_create_mark(buf, NULL, &end, TRUE);
+
+    /* Timestamp */
+    time_t now = time(NULL);
+    char tbuf[12];
+    strftime(tbuf, sizeof(tbuf), "[%H:%M:%S] ", localtime(&now));
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, tbuf, -1, "ts", NULL);
+
+    /* Priority badge */
+    if (priority == PRIORITY_CRITICAL)
+        gtk_text_buffer_insert_with_tags_by_name(buf, &end, "CRITICAL ", -1, "critical", NULL);
+    else if (priority == PRIORITY_URGENT)
+        gtk_text_buffer_insert_with_tags_by_name(buf, &end, "URGENT ", -1, "urgent", NULL);
+
+    /* Offline replay badge */
+    if (flags & MSG_FLAG_IS_OFFLINE_REPLAY)
+        gtk_text_buffer_insert_with_tags_by_name(buf, &end, "[queued] ", -1, "queued", NULL);
+
+    /* Sender */
+    const char *stag = is_self ? "self" : "other";
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, sender, -1, stag, NULL);
+    gtk_text_buffer_insert(buf, &end, ":  ", -1);
+
+    /* Message body */
+    gtk_text_buffer_insert(buf, &end, text, -1);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
+
+    /* Apply priority color across the entire line using the mark */
+    if (priority == PRIORITY_CRITICAL || priority == PRIORITY_URGENT) {
+        GtkTextIter line_start;
+        gtk_text_buffer_get_iter_at_mark(buf, &line_start, line_mark);
+        gtk_text_buffer_get_end_iter(buf, &end);
+        const char *ptag = (priority == PRIORITY_CRITICAL) ? "critical" : "urgent";
+        gtk_text_buffer_apply_tag_by_name(buf, ptag, &line_start, &end);
     }
+    gtk_text_buffer_delete_mark(buf, line_mark);
+
+    chat_scroll_to_bottom();
 }
 
-static void scroll_log_to_end(GtkTextView *view) {
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(view);
-    GtkTextIter end_iter;
-    gtk_text_buffer_get_end_iter(buffer, &end_iter);
-    gtk_text_view_scroll_to_iter(view, &end_iter, 0.0, FALSE, 0.0, 0.0);
+/* Idle struct for cross-thread message delivery */
+typedef struct { char sender[MAX_USERNAME_LEN + 32]; char text[MAX_MSG_LEN]; uint8_t priority; uint8_t flags; } MsgData;
+
+static gboolean message_idle(gpointer data) {
+    MsgData *md = (MsgData *)data;
+    chat_append(md->sender, md->text, md->priority, md->flags, FALSE);
+    g_free(md);
+    return G_SOURCE_REMOVE;
 }
 
-static void on_send_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
-    GtkClientApp *app = (GtkClientApp *)user_data;
-    const char *message = gtk_entry_get_text(GTK_ENTRY(app->message_entry));
-    const char *recipient = gtk_entry_get_text(GTK_ENTRY(app->recipient_entry));
-    gboolean broadcast = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->broadcast_check));
+static void on_message_cb(const char *sender, const char *text,
+                           uint8_t priority, uint8_t flags) {
+    MsgData *md = g_new(MsgData, 1);
+    strncpy(md->sender, sender, sizeof(md->sender) - 1);
+    strncpy(md->text,   text,   sizeof(md->text)   - 1);
+    md->priority = priority;
+    md->flags    = flags;
+    gdk_threads_add_idle(message_idle, md);
+}
 
-    gchar *priority_text = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(app->priority_combo));
+/* ── "To" dropdown label sync ─────────────────────────────────── */
+static void sync_to_label(void) {
+    if (!g_to_button) return;
+
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_all_check))) {
+        gtk_button_set_label(GTK_BUTTON(g_to_button), "To: Everyone (All)");
+        return;
+    }
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_users_check_box));
+    GString *names = g_string_new("To: ");
+    gboolean any = FALSE;
+    for (GList *l = kids; l; l = l->next) {
+        GtkWidget *w = GTK_WIDGET(l->data);
+        if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w))) {
+            if (any) g_string_append(names, ", ");
+            g_string_append(names, gtk_button_get_label(GTK_BUTTON(w)));
+            any = TRUE;
+        }
+    }
+    g_list_free(kids);
+
+    if (!any) g_string_append(names, "— select recipients —");
+    gtk_button_set_label(GTK_BUTTON(g_to_button), names->str);
+    g_string_free(names, TRUE);
+}
+
+static void on_recipient_toggled(GtkToggleButton *btn, gpointer data) {
+    (void)btn; (void)data;
+    sync_to_label();
+}
+
+/* When "Everyone" is checked, uncheck all individual users */
+static void on_all_toggled(GtkToggleButton *btn, gpointer data) {
+    (void)data;
+    if (gtk_toggle_button_get_active(btn)) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(g_users_check_box));
+        for (GList *l = kids; l; l = l->next)
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(l->data), FALSE);
+        g_list_free(kids);
+    }
+    sync_to_label();
+}
+
+/* ── Send ─────────────────────────────────────────────────────── */
+static void on_send_clicked(GtkButton *btn, gpointer data) {
+    (void)btn; (void)data;
+    const char *text = gtk_entry_get_text(GTK_ENTRY(g_entry));
+    if (!text || !text[0]) return;
+
     uint8_t priority = PRIORITY_NORMAL;
-    if (priority_text) {
-        if (strcmp(priority_text, "URGENT") == 0) {
-            priority = PRIORITY_URGENT;
-        } else if (strcmp(priority_text, "CRITICAL") == 0) {
-            priority = PRIORITY_CRITICAL;
+    if (g_radio_critical && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_radio_critical)))
+        priority = PRIORITY_CRITICAL;
+    else if (g_radio_urgent && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_radio_urgent)))
+        priority = PRIORITY_URGENT;
+
+    /* Direct entry overrides dropdown — allows sending to offline users */
+    const char *direct = gtk_entry_get_text(GTK_ENTRY(g_direct_entry));
+    if (direct && direct[0]) {
+        client_send_chat_message_ex(&g_ctx, direct, text, priority);
+        char echo_label[MAX_USERNAME_LEN + 8];
+        snprintf(echo_label, sizeof(echo_label), "You → %s", direct);
+        chat_append(echo_label, text, priority, 0, TRUE);
+        gtk_entry_set_text(GTK_ENTRY(g_direct_entry), "");
+        gtk_entry_set_text(GTK_ENTRY(g_entry), "");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_radio_normal), TRUE);
+        gtk_widget_grab_focus(g_entry);
+        return;
+    }
+
+    /* Require at least one recipient selected in dropdown */
+    gboolean all_checked = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_all_check));
+    if (!all_checked) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(g_users_check_box));
+        gboolean any = FALSE;
+        for (GList *l = kids; l; l = l->next)
+            if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(l->data))) { any = TRUE; break; }
+        g_list_free(kids);
+        if (!any) {
+            gtk_label_set_markup(GTK_LABEL(g_to_hint),
+                "<span foreground='red'>Select a recipient, check Everyone (All), or type a username directly</span>");
+            return;
         }
-        g_free(priority_text);
     }
+    gtk_label_set_text(GTK_LABEL(g_to_hint), "");
 
-    if (!app->connected) {
-        set_status(app, "[!] Not connected yet");
-        pump_events();
-        return;
-    }
+    /* Build display label for echo ("You → bob" or "You → All") */
+    char echo_label[MAX_USERNAME_LEN * 4];
 
-    if (!message || strlen(message) == 0) {
-        return;
-    }
-
-    if (!broadcast && (!recipient || strlen(recipient) == 0)) {
-        set_status(app, "[!] Enter recipient or click from Online Users");
-        pump_events();
-        return;
-    }
-
-    char directed[MAX_MSG_LEN];
-    if (broadcast) {
-        snprintf(directed, sizeof(directed), "@all %s", message);
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_all_check))) {
+        client_send_chat_message_ex(&g_ctx, "", text, priority);
+        snprintf(echo_label, sizeof(echo_label), "You → All");
     } else {
-        snprintf(directed, sizeof(directed), "@%s %s", recipient, message);
-    }
-
-    if (client_send_chat_message_ex(&app->client, directed, priority) == 0) {
-        char line[512];
-        if (broadcast) {
-            snprintf(line, sizeof(line), "[YOU -> ALL][%s] %s",
-                     (priority == PRIORITY_CRITICAL) ? "CRITICAL" :
-                     (priority == PRIORITY_URGENT) ? "URGENT" : "NORMAL",
-                     message);
-        } else {
-            snprintf(line, sizeof(line), "[YOU -> %s][%s] %s", recipient,
-                     (priority == PRIORITY_CRITICAL) ? "CRITICAL" :
-                     (priority == PRIORITY_URGENT) ? "URGENT" : "NORMAL",
-                     message);
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(g_users_check_box));
+        GString *names = g_string_new("You → ");
+        gboolean first = TRUE;
+        for (GList *l = kids; l; l = l->next) {
+            GtkWidget *w = GTK_WIDGET(l->data);
+            if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w))) {
+                const char *name = gtk_button_get_label(GTK_BUTTON(w));
+                client_send_chat_message_ex(&g_ctx, name, text, priority);
+                if (!first) g_string_append(names, ", ");
+                g_string_append(names, name);
+                first = FALSE;
+            }
         }
-        append_log_line(app, line);
-        gtk_entry_set_text(GTK_ENTRY(app->message_entry), "");
-        scroll_log_to_end(GTK_TEXT_VIEW(app->log_view));
-        pump_events();
-    } else {
-        set_status(app, "[!] Failed to send message");
-        pump_events();
+        g_list_free(kids);
+        strncpy(echo_label, names->str, sizeof(echo_label) - 1);
+        echo_label[sizeof(echo_label) - 1] = '\0';
+        g_string_free(names, TRUE);
     }
+
+    /* Echo sent message in own chat view */
+    chat_append(echo_label, text, priority, 0, TRUE);
+
+    gtk_entry_set_text(GTK_ENTRY(g_entry), "");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_radio_normal), TRUE);
+    gtk_widget_grab_focus(g_entry);
 }
 
-static void on_quick_action_clicked(GtkButton *button, gpointer user_data) {
-    GtkClientApp *app = (GtkClientApp *)user_data;
-    const char *action = gtk_button_get_label(button);
-
-    if (strcmp(action, "Emergency Broadcast") == 0) {
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->broadcast_check), TRUE);
-        gtk_combo_box_set_active(GTK_COMBO_BOX(app->priority_combo), 2);
-        gtk_entry_set_text(GTK_ENTRY(app->message_entry), "Emergency alert: check in immediately.");
-    } else if (strcmp(action, "Status Check") == 0) {
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->broadcast_check), FALSE);
-        gtk_combo_box_set_active(GTK_COMBO_BOX(app->priority_combo), 1);
-        gtk_entry_set_text(GTK_ENTRY(app->message_entry), "Status check: please confirm availability.");
-    } else if (strcmp(action, "Team Sync") == 0) {
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->broadcast_check), TRUE);
-        gtk_combo_box_set_active(GTK_COMBO_BOX(app->priority_combo), 0);
-        gtk_entry_set_text(GTK_ENTRY(app->message_entry), "Team sync in 5 minutes.");
-    }
-
-    gtk_widget_grab_focus(app->message_entry);
+static void on_entry_activate(GtkEntry *e, gpointer d) {
+    (void)e; (void)d;
+    on_send_clicked(NULL, NULL);
 }
 
-static void on_refresh_users_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
-    GtkClientApp *app = (GtkClientApp *)user_data;
-
-    if (!app->connected) {
-        return;
-    }
-
-    if (client_request_user_list(&app->client) != 0) {
-        set_status(app, "[!] Failed to refresh users");
-    }
+static void on_refresh_users(GtkButton *btn, gpointer data) {
+    (void)btn; (void)data;
+    client_request_user_list(&g_ctx);
 }
 
-static gboolean start_backend(GtkClientApp *app, const char *host, int port, const char *username) {
-    client_set_log_callback(gtk_log_callback, app);
+/* ── Users list update (called from recv thread via idle) ─────── */
+typedef struct { char *list; char *me; } UsersIdleData;
 
-    set_status(app, "Starting client backend...");
-    pump_events();
+static gboolean update_users_idle(gpointer data) {
+    UsersIdleData *ud = (UsersIdleData *)data;
 
-    if (tls_init() != SUCCESS) {
-        set_status(app, "[ERROR] Failed to initialize OpenSSL");
-        return FALSE;
+    /* ── Rebuild right-panel display list ── */
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_users_list));
+    for (GList *l = kids; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    /* ── Rebuild checkbox box in popover ── */
+    kids = gtk_container_get_children(GTK_CONTAINER(g_users_check_box));
+    for (GList *l = kids; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    char *copy = g_strdup(ud->list);
+    char *token = strtok(copy, ",");
+    while (token) {
+        /* Skip self in both panels */
+        if (ud->me && strcmp(token, ud->me) == 0) {
+            token = strtok(NULL, ",");
+            continue;
+        }
+
+        /* Right panel label */
+        GtkWidget *lbl = gtk_label_new(token);
+        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+        gtk_list_box_insert(GTK_LIST_BOX(g_users_list), lbl, -1);
+
+        /* Recipient checkbox in dropdown */
+        if (TRUE) {
+            GtkWidget *chk = gtk_check_button_new_with_label(token);
+            g_signal_connect(chk, "toggled", G_CALLBACK(on_recipient_toggled), NULL);
+            gtk_box_pack_start(GTK_BOX(g_users_check_box), chk, FALSE, FALSE, 0);
+        }
+
+        token = strtok(NULL, ",");
     }
+    g_free(copy);
 
-    if (client_init(&app->client, host, port, username) != 0) {
-        set_status(app, "[ERROR] Client initialization failed");
-        return FALSE;
-    }
+    gtk_widget_show_all(g_users_list);
+    gtk_widget_show_all(g_users_check_box);
 
-    if (perform_dh_exchange(&app->client) != 0) {
-        set_status(app, "[ERROR] DH exchange failed");
-        client_cleanup(&app->client);
-        return FALSE;
-    }
+    sync_to_label();
 
-    if (authenticate_with_server(&app->client) != 0) {
-        set_status(app, "[ERROR] Authentication failed");
-        client_cleanup(&app->client);
-        return FALSE;
-    }
-
-    app->connected = TRUE;
-
-    if (pthread_create(&app->client.recv_thread, NULL, recv_thread_func, &app->client) != 0) {
-        set_status(app, "[ERROR] Failed to start receive thread");
-        client_cleanup(&app->client);
-        app->connected = FALSE;
-        return FALSE;
-    }
-
-    pthread_detach(app->client.recv_thread);
-    gtk_widget_set_sensitive(app->send_button, TRUE);
-    gtk_widget_set_sensitive(app->refresh_users_button, TRUE);
-    gtk_widget_set_sensitive(app->connect_button, FALSE);
-
-    char welcome[128];
-    snprintf(welcome, sizeof(welcome), "Connected as %s", username);
-    set_status(app, welcome);
-
-    (void)client_request_user_list(&app->client);
-    g_timeout_add_seconds(3, request_user_list_timer, app);
-    return TRUE;
+    g_free(ud->list);
+    g_free(ud->me);
+    g_free(ud);
+    return G_SOURCE_REMOVE;
 }
 
-static gboolean request_user_list_timer(gpointer data) {
-    GtkClientApp *app = (GtkClientApp *)data;
-
-    if (!app->connected || !app->client.running) {
-        return G_SOURCE_REMOVE;
-    }
-
-    (void)client_request_user_list(&app->client);
-    return G_SOURCE_CONTINUE;
+static void on_users_cb(const char *list) {
+    UsersIdleData *ud = g_new(UsersIdleData, 1);
+    ud->list = g_strdup(list);
+    ud->me   = g_strdup(g_ctx.username);
+    gdk_threads_add_idle(update_users_idle, ud);
 }
 
-static void on_connect_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
-    GtkClientApp *app = (GtkClientApp *)user_data;
+/* ── Build main chat window ───────────────────────────────────── */
+static void build_chat_window(const char *username) {
+    g_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    char title[64];
+    snprintf(title, sizeof(title), "Secure Chat — %s", username);
+    gtk_window_set_title(GTK_WINDOW(g_window), title);
+    gtk_window_set_default_size(GTK_WINDOW(g_window), 960, 620);
+    g_signal_connect(g_window, "delete-event", G_CALLBACK(on_delete_event), NULL);
 
-    const char *host = gtk_entry_get_text(GTK_ENTRY(app->host_entry));
-    const char *port_text = gtk_entry_get_text(GTK_ENTRY(app->port_entry));
-    const char *username = gtk_entry_get_text(GTK_ENTRY(app->username_entry));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(g_window), 6);
+    gtk_container_add(GTK_CONTAINER(g_window), vbox);
 
-    if (!host || strlen(host) == 0 || !port_text || strlen(port_text) == 0 || !username || strlen(username) == 0) {
-        set_status(app, "[!] Host, port, and username are required");
-        return;
-    }
+    /* "Logged in as: alice" */
+    char me_text[MAX_USERNAME_LEN + 32];
+    snprintf(me_text, sizeof(me_text), "Logged in as:  <b>%s</b>", username);
+    g_status_bar = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(g_status_bar), me_text);
+    gtk_label_set_xalign(GTK_LABEL(g_status_bar), 0.0f);
+    gtk_box_pack_start(GTK_BOX(vbox), g_status_bar, FALSE, FALSE, 2);
 
-    int port = atoi(port_text);
-    if (port <= 0) {
-        set_status(app, "[!] Invalid port number");
-        return;
-    }
+    gtk_box_pack_start(GTK_BOX(vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
-    gtk_widget_set_sensitive(app->connect_button, FALSE);
-    set_status(app, "Connecting...");
-    pump_events();
+    /* Main area: chat + right panel */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, TRUE, TRUE, 0);
 
-    if (!start_backend(app, host, port, username)) {
-        gtk_widget_set_sensitive(app->connect_button, TRUE);
-        gtk_widget_set_sensitive(app->send_button, FALSE);
-        gtk_widget_set_sensitive(app->refresh_users_button, FALSE);
-    }
-}
+    /* Chat text view */
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    g_text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(g_text_view), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(g_text_view), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(g_text_view), 6);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(g_text_view), 6);
+    gtk_container_add(GTK_CONTAINER(scroll), g_text_view);
 
-static void on_message_activate(GtkEntry *entry, gpointer user_data) {
-    (void)entry;
-    on_send_clicked(NULL, user_data);
-}
+    /* Text tags for rich formatting */
+    GtkTextBuffer *tbuf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_text_view));
+    gtk_text_buffer_create_tag(tbuf, "ts",
+        "foreground", "#888888", "font", "monospace 9", NULL);
+    gtk_text_buffer_create_tag(tbuf, "self",
+        "foreground", "#2e7d32", "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(tbuf, "other",
+        "foreground", "#1565c0", "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(tbuf, "urgent",
+        "foreground", "#e65100", "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(tbuf, "critical",
+        "foreground", "#b71c1c", "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(tbuf, "queued",
+        "foreground", "#888888", "style", PANGO_STYLE_ITALIC, NULL);
+    gtk_text_buffer_create_tag(tbuf, "sys",
+        "foreground", "#888888", "style", PANGO_STYLE_ITALIC, NULL);
+    gtk_box_pack_start(GTK_BOX(hbox), scroll, TRUE, TRUE, 0);
 
-static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
-    (void)widget;
-    GtkClientApp *app = (GtkClientApp *)user_data;
+    /* Right panel: online users display */
+    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_size_request(right, 160, -1);
+    gtk_box_pack_start(GTK_BOX(hbox), right, FALSE, FALSE, 0);
 
-    app->client.running = 0;
-    app->connected = FALSE;
-    if (app->client.tcp_socket >= 0) {
-        shutdown(app->client.tcp_socket, SHUT_RDWR);
-    }
-
-    client_cleanup(&app->client);
-    gtk_main_quit();
-}
-
-static GtkWidget *create_labeled_entry(GtkGrid *grid, const char *label, int row, const char *default_text) {
-    GtkWidget *lbl = gtk_label_new(label);
-    GtkWidget *entry = gtk_entry_new();
-
-    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
-    if (default_text) {
-        gtk_entry_set_text(GTK_ENTRY(entry), default_text);
-    }
-
-    gtk_grid_attach(grid, lbl, 0, row, 1, 1);
-    gtk_grid_attach(grid, entry, 1, row, 1, 1);
-    return entry;
-}
-
-int main(int argc, char *argv[]) {
-    GtkClientApp app;
-    memset(&app, 0, sizeof(app));
-    app.client.tcp_socket = -1;
-    app.client.udp_socket = -1;
-
-    gtk_init(&argc, &argv);
-
-    app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(app.window), "Adaptive Secure Communication System");
-    gtk_window_set_default_size(GTK_WINDOW(app.window), 980, 680);
-    gtk_container_set_border_width(GTK_CONTAINER(app.window), 16);
-
-    g_signal_connect(app.window, "destroy", G_CALLBACK(on_window_destroy), &app);
-
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_container_add(GTK_CONTAINER(app.window), outer);
-
-    GtkWidget *title = gtk_label_new("Adaptive Secure Communication System");
-    gtk_widget_set_halign(title, GTK_ALIGN_START);
-    gtk_style_context_add_class(gtk_widget_get_style_context(title), "title-1");
-    gtk_box_pack_start(GTK_BOX(outer), title, FALSE, FALSE, 0);
-
-    GtkWidget *subtitle = gtk_label_new("Secure directed messaging with live online-user selection");
-    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(outer), subtitle, FALSE, FALSE, 0);
-
-    GtkWidget *config_frame = gtk_frame_new("Connection");
-    gtk_box_pack_start(GTK_BOX(outer), config_frame, FALSE, FALSE, 0);
-
-    GtkWidget *config_grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(config_grid), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(config_grid), 8);
-    gtk_container_set_border_width(GTK_CONTAINER(config_grid), 12);
-    gtk_container_add(GTK_CONTAINER(config_frame), config_grid);
-
-    app.host_entry = create_labeled_entry(GTK_GRID(config_grid), "Host", 0, "localhost");
-    app.port_entry = create_labeled_entry(GTK_GRID(config_grid), "Port", 1, "8080");
-    app.username_entry = create_labeled_entry(GTK_GRID(config_grid), "Username", 2, "alice");
-    app.recipient_entry = create_labeled_entry(GTK_GRID(config_grid), "To", 3, "bob");
-
-    GtkWidget *priority_label = gtk_label_new("Priority");
-    gtk_label_set_xalign(GTK_LABEL(priority_label), 0.0f);
-    gtk_grid_attach(GTK_GRID(config_grid), priority_label, 0, 4, 1, 1);
-
-    app.priority_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.priority_combo), "NORMAL");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.priority_combo), "URGENT");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.priority_combo), "CRITICAL");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(app.priority_combo), 0);
-    gtk_grid_attach(GTK_GRID(config_grid), app.priority_combo, 1, 4, 1, 1);
-
-    app.broadcast_check = gtk_check_button_new_with_label("Broadcast to all online users");
-    gtk_grid_attach(GTK_GRID(config_grid), app.broadcast_check, 0, 5, 2, 1);
-
-    app.connect_button = gtk_button_new_with_label("Connect");
-    gtk_grid_attach(GTK_GRID(config_grid), app.connect_button, 0, 6, 1, 1);
-    g_signal_connect(app.connect_button, "clicked", G_CALLBACK(on_connect_clicked), &app);
-
-    app.refresh_users_button = gtk_button_new_with_label("Refresh Users");
-    gtk_widget_set_sensitive(app.refresh_users_button, FALSE);
-    gtk_grid_attach(GTK_GRID(config_grid), app.refresh_users_button, 1, 6, 1, 1);
-    g_signal_connect(app.refresh_users_button, "clicked", G_CALLBACK(on_refresh_users_clicked), &app);
-
-    GtkWidget *quick_frame = gtk_frame_new("Quick Actions");
-    gtk_box_pack_start(GTK_BOX(outer), quick_frame, FALSE, FALSE, 0);
-
-    GtkWidget *quick_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_container_set_border_width(GTK_CONTAINER(quick_box), 8);
-    gtk_container_add(GTK_CONTAINER(quick_frame), quick_box);
-
-    GtkWidget *btn_emergency = gtk_button_new_with_label("Emergency Broadcast");
-    GtkWidget *btn_status = gtk_button_new_with_label("Status Check");
-    GtkWidget *btn_sync = gtk_button_new_with_label("Team Sync");
-
-    gtk_box_pack_start(GTK_BOX(quick_box), btn_emergency, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(quick_box), btn_status, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(quick_box), btn_sync, FALSE, FALSE, 0);
-
-    g_signal_connect(btn_emergency, "clicked", G_CALLBACK(on_quick_action_clicked), &app);
-    g_signal_connect(btn_status, "clicked", G_CALLBACK(on_quick_action_clicked), &app);
-    g_signal_connect(btn_sync, "clicked", G_CALLBACK(on_quick_action_clicked), &app);
-
-    GtkWidget *center = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_box_pack_start(GTK_BOX(outer), center, TRUE, TRUE, 0);
-
-    GtkWidget *users_frame = gtk_frame_new("Online Users");
-    gtk_box_pack_start(GTK_BOX(center), users_frame, FALSE, FALSE, 0);
-    gtk_widget_set_size_request(users_frame, 220, -1);
-
-    GtkWidget *users_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_container_set_border_width(GTK_CONTAINER(users_box), 8);
-    gtk_container_add(GTK_CONTAINER(users_frame), users_box);
-
-    app.users_count_label = gtk_label_new("Online users: 0");
-    gtk_widget_set_halign(app.users_count_label, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(users_box), app.users_count_label, FALSE, FALSE, 0);
+    GtkWidget *ul = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(ul), "<b>Online Users</b>");
+    gtk_box_pack_start(GTK_BOX(right), ul, FALSE, FALSE, 0);
 
     GtkWidget *users_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(users_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(users_box), users_scroll, TRUE, TRUE, 0);
+    g_users_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_users_list), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(users_scroll), g_users_list);
+    gtk_box_pack_start(GTK_BOX(right), users_scroll, TRUE, TRUE, 0);
 
-    app.users_listbox = gtk_list_box_new();
-    gtk_container_add(GTK_CONTAINER(users_scroll), app.users_listbox);
-    g_signal_connect(app.users_listbox, "row-selected", G_CALLBACK(on_user_row_selected), &app);
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_users), NULL);
+    gtk_box_pack_start(GTK_BOX(right), refresh_btn, FALSE, FALSE, 0);
 
-    GtkWidget *log_frame = gtk_frame_new("Conversation Log");
-    gtk_box_pack_start(GTK_BOX(center), log_frame, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
-    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_container_set_border_width(GTK_CONTAINER(scrolled), 8);
-    gtk_container_add(GTK_CONTAINER(log_frame), scrolled);
+    /* "To" row: MenuButton with checkbox popover */
+    GtkWidget *to_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(vbox), to_row, FALSE, FALSE, 2);
 
-    GtkWidget *text_view = gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
-    gtk_container_add(GTK_CONTAINER(scrolled), text_view);
-    app.log_view = text_view;
-    app.log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    GtkWidget *to_lbl = gtk_label_new("To:");
+    gtk_box_pack_start(GTK_BOX(to_row), to_lbl, FALSE, FALSE, 4);
 
-    GtkWidget *compose_frame = gtk_frame_new("Message");
-    gtk_box_pack_start(GTK_BOX(outer), compose_frame, FALSE, FALSE, 0);
+    g_to_button = gtk_menu_button_new();
+    gtk_button_set_label(GTK_BUTTON(g_to_button), "To: — select recipients —");
+    gtk_widget_set_hexpand(g_to_button, TRUE);
+    gtk_box_pack_start(GTK_BOX(to_row), g_to_button, TRUE, TRUE, 0);
 
-    GtkWidget *compose_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_container_set_border_width(GTK_CONTAINER(compose_box), 12);
-    gtk_container_add(GTK_CONTAINER(compose_frame), compose_box);
+    /* Build the popover */
+    GtkWidget *popover   = gtk_popover_new(g_to_button);
+    GtkWidget *pop_box   = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(pop_box), 8);
+    gtk_widget_set_size_request(pop_box, 200, -1);
+    gtk_container_add(GTK_CONTAINER(popover), pop_box);
 
-    app.message_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app.message_entry), "Type message and press Enter");
-    gtk_box_pack_start(GTK_BOX(compose_box), app.message_entry, TRUE, TRUE, 0);
-    g_signal_connect(app.message_entry, "activate", G_CALLBACK(on_message_activate), &app);
+    g_all_check = gtk_check_button_new_with_label("Everyone (All)");
+    g_signal_connect(g_all_check, "toggled", G_CALLBACK(on_all_toggled), NULL);
+    gtk_box_pack_start(GTK_BOX(pop_box), g_all_check, FALSE, FALSE, 0);
 
-    app.send_button = gtk_button_new_with_label("Send");
-    gtk_widget_set_sensitive(app.send_button, FALSE);
-    gtk_box_pack_start(GTK_BOX(compose_box), app.send_button, FALSE, FALSE, 0);
-    g_signal_connect(app.send_button, "clicked", G_CALLBACK(on_send_clicked), &app);
+    gtk_box_pack_start(GTK_BOX(pop_box),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 2);
 
-    app.status_label = gtk_label_new("Ready");
-    gtk_widget_set_halign(app.status_label, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(outer), app.status_label, FALSE, FALSE, 0);
+    g_users_check_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_box_pack_start(GTK_BOX(pop_box), g_users_check_box, FALSE, FALSE, 0);
 
-    gtk_widget_show_all(app.window);
-    gtk_widget_set_sensitive(app.send_button, FALSE);
-    gtk_widget_set_sensitive(app.refresh_users_button, FALSE);
+    gtk_widget_show_all(pop_box);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(g_to_button), popover);
 
+    /* Direct entry for offline/unlisted users */
+    g_direct_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_direct_entry), "or type username directly");
+    gtk_widget_set_size_request(g_direct_entry, 180, -1);
+    gtk_box_pack_start(GTK_BOX(to_row), g_direct_entry, FALSE, FALSE, 0);
+
+    /* Hint label shown when Send is clicked with no recipient */
+    g_to_hint = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(g_to_hint), 0.0f);
+    gtk_box_pack_start(GTK_BOX(vbox), g_to_hint, FALSE, FALSE, 0);
+
+    /* Priority radio buttons */
+    GtkWidget *prio_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(vbox), prio_row, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(prio_row), gtk_label_new("Priority:"), FALSE, FALSE, 4);
+
+    g_radio_normal = gtk_radio_button_new_with_label(NULL, "Normal");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_radio_normal), TRUE);
+    gtk_box_pack_start(GTK_BOX(prio_row), g_radio_normal, FALSE, FALSE, 0);
+
+    g_radio_urgent = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(g_radio_normal), "Urgent");
+    gtk_box_pack_start(GTK_BOX(prio_row), g_radio_urgent, FALSE, FALSE, 0);
+
+    g_radio_critical = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(g_radio_normal), "Critical");
+    gtk_box_pack_start(GTK_BOX(prio_row), g_radio_critical, FALSE, FALSE, 0);
+
+    /* Message entry + Send */
+    GtkWidget *msg_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(vbox), msg_row, FALSE, FALSE, 4);
+
+    g_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_entry), "Type a message…");
+    g_signal_connect(g_entry, "activate", G_CALLBACK(on_entry_activate), NULL);
+    gtk_box_pack_start(GTK_BOX(msg_row), g_entry, TRUE, TRUE, 0);
+
+    GtkWidget *send_btn = gtk_button_new_with_label("Send");
+    g_signal_connect(send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(msg_row), send_btn, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(g_window);
+    gtk_widget_grab_focus(g_entry);
+
+    /* Fetch user list on connect and every 5 seconds after */
+    client_request_user_list(&g_ctx);
+    g_timeout_add_seconds(5, (GSourceFunc)client_request_user_list, &g_ctx);
+}
+
+/* ── Login window ─────────────────────────────────────────────── */
+static void on_connect_clicked(GtkButton *btn, gpointer data) {
+    (void)btn;
+    GtkWidget **fields    = (GtkWidget **)data;
+    GtkWidget *host_entry  = fields[0];
+    GtkWidget *port_entry  = fields[1];
+    GtkWidget *user_entry  = fields[2];
+    GtkWidget *err_label   = fields[3];
+    GtkWidget *login_win   = fields[4];
+
+    const char *host     = gtk_entry_get_text(GTK_ENTRY(host_entry));
+    const char *port_str = gtk_entry_get_text(GTK_ENTRY(port_entry));
+    const char *username = gtk_entry_get_text(GTK_ENTRY(user_entry));
+
+    if (!username || username[0] == '\0') {
+        gtk_label_set_text(GTK_LABEL(err_label), "Username cannot be empty.");
+        return;
+    }
+    if (!host || host[0] == '\0') host = "localhost";
+    int port = (port_str && port_str[0]) ? atoi(port_str) : SERVER_PORT;
+
+    gtk_label_set_text(GTK_LABEL(err_label), "Connecting…");
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.message_callback = on_message_cb;
+    g_ctx.system_callback  = on_system_cb;
+    g_ctx.users_callback   = on_users_cb;
+
+    if (client_connect(&g_ctx, host, port, username) != 0) {
+        const char *reason = g_ctx.connect_error[0]
+                             ? g_ctx.connect_error
+                             : "Connection failed. Is the server running?";
+        gtk_label_set_text(GTK_LABEL(err_label), reason);
+        return;
+    }
+
+    char saved[MAX_USERNAME_LEN];
+    strncpy(saved, username, MAX_USERNAME_LEN - 1);
+    saved[MAX_USERNAME_LEN - 1] = '\0';
+
+    gtk_widget_destroy(login_win);
+    build_chat_window(saved);
+}
+
+static void show_login_window(void) {
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "Secure Chat — Connect");
+    gtk_window_set_default_size(GTK_WINDOW(win), 380, 260);
+    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+    gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
+    g_signal_connect(win, "delete-event", G_CALLBACK(on_delete_event), NULL);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 20);
+    gtk_container_add(GTK_CONTAINER(win), vbox);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title), "<b><big>Secure Chat</big></b>");
+    gtk_box_pack_start(GTK_BOX(vbox), title, FALSE, FALSE, 4);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_box_pack_start(GTK_BOX(vbox), grid, FALSE, FALSE, 0);
+
+    GtkWidget *host_lbl = gtk_label_new("Host:");
+    gtk_label_set_xalign(GTK_LABEL(host_lbl), 1.0f);
+    GtkWidget *host_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(host_entry), "localhost");
+    gtk_widget_set_hexpand(host_entry, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), host_lbl,   0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), host_entry, 1, 0, 1, 1);
+
+    GtkWidget *port_lbl = gtk_label_new("Port:");
+    gtk_label_set_xalign(GTK_LABEL(port_lbl), 1.0f);
+    GtkWidget *port_entry = gtk_entry_new();
+    char port_default[8];
+    snprintf(port_default, sizeof(port_default), "%d", SERVER_PORT);
+    gtk_entry_set_text(GTK_ENTRY(port_entry), port_default);
+    gtk_grid_attach(GTK_GRID(grid), port_lbl,   0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), port_entry, 1, 1, 1, 1);
+
+    GtkWidget *user_lbl = gtk_label_new("Username:");
+    gtk_label_set_xalign(GTK_LABEL(user_lbl), 1.0f);
+    GtkWidget *user_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(user_entry), "e.g. alice");
+    gtk_grid_attach(GTK_GRID(grid), user_lbl,   0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), user_entry, 1, 2, 1, 1);
+
+    GtkWidget *err_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(err_label), 0.5f);
+    gtk_box_pack_start(GTK_BOX(vbox), err_label, FALSE, FALSE, 0);
+
+    GtkWidget *connect_btn = gtk_button_new_with_label("Connect");
+    gtk_box_pack_start(GTK_BOX(vbox), connect_btn, FALSE, FALSE, 4);
+
+    static GtkWidget *fields[5];
+    fields[0] = host_entry;
+    fields[1] = port_entry;
+    fields[2] = user_entry;
+    fields[3] = err_label;
+    fields[4] = win;
+
+    g_signal_connect(connect_btn, "clicked", G_CALLBACK(on_connect_clicked), fields);
+    g_signal_connect(user_entry,  "activate", G_CALLBACK(on_connect_clicked), fields);
+
+    gtk_widget_show_all(win);
+    gtk_widget_grab_focus(user_entry);
+    gtk_editable_select_region(GTK_EDITABLE(host_entry), 0, 0);
+    gtk_editable_select_region(GTK_EDITABLE(port_entry), 0, 0);
+}
+
+/* ── Entry point ──────────────────────────────────────────────── */
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+    show_login_window();
     gtk_main();
+    if (g_ctx.running)
+        client_disconnect(&g_ctx);
     return 0;
 }
+
+#else
+#include <stdio.h>
+int main(void) {
+    fprintf(stderr, "GTK client not built — recompile with: make gtk-client\n");
+    return 1;
+}
+#endif /* HAVE_GTK */

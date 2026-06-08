@@ -1,187 +1,86 @@
-#include "crypto.h"
 #include <string.h>
+#include <stdio.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include "crypto.h"
+#include "common.h"
 
-/* Generate random 12-byte IV for AES-GCM */
-int aes_generate_iv(unsigned char *iv_buf) {
-    if (!iv_buf) {
-        return ERROR_CRYPTO;
-    }
-    
-    if (RAND_bytes(iv_buf, 12) != 1) {
-        return ERROR_CRYPTO;
-    }
-    
-    return SUCCESS;
-}
-
-/* AES-256-GCM encryption */
 int aes_encrypt(const unsigned char *key,
                 const unsigned char *iv,
                 const unsigned char *plaintext, int plaintext_len,
-                unsigned char *ciphertext_buf,
-                unsigned char *tag_out) {
-    if (!key || !iv || !plaintext || !ciphertext_buf || !tag_out) {
-        return ERROR_CRYPTO;
-    }
-    
+                unsigned char *ciphertext_buf) {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return ERROR_CRYPTO;
-    }
-    
-    int len = 0;
-    int ciphertext_len = 0;
-    int ret = ERROR_CRYPTO;
-    
-    /* Initialize encryption with GCM */
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
-        goto cleanup;
-    }
-    
-    /* Set IV length to 12 bytes */
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) {
-        goto cleanup;
-    }
-    
-    /* Set key and IV */
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) {
-        goto cleanup;
-    }
-    
-    /* Encrypt plaintext */
-    if (EVP_EncryptUpdate(ctx, ciphertext_buf, &len, plaintext, plaintext_len) != 1) {
-        goto cleanup;
-    }
-    ciphertext_len = len;
-    
-    /* Finalize encryption (no padding is added for GCM, but call is required) */
-    if (EVP_EncryptFinal_ex(ctx, ciphertext_buf + len, &len) != 1) {
-        goto cleanup;
-    }
-    ciphertext_len += len;
-    
-    /* Get GCM tag (16 bytes) */
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag_out) != 1) {
-        goto cleanup;
-    }
-    
-    ret = ciphertext_len;
-    
-cleanup:
+    if (!ctx) return -1;
+
+    int len = 0, total = 0, rc = -1;
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) goto done;
+    if (EVP_EncryptUpdate(ctx, ciphertext_buf, &len, plaintext, plaintext_len) != 1) goto done;
+    total = len;
+    if (EVP_EncryptFinal_ex(ctx, ciphertext_buf + total, &len) != 1) goto done;
+    total += len;
+    rc = total;
+
+done:
     EVP_CIPHER_CTX_free(ctx);
-    return ret;
+    if (rc < 0) ERR_print_errors_fp(stderr);
+    return rc;
 }
 
-/* AES-256-GCM decryption */
 int aes_decrypt(const unsigned char *key,
                 const unsigned char *iv,
                 const unsigned char *ciphertext, int ciphertext_len,
-                const unsigned char *tag,
                 unsigned char *plaintext_buf) {
-    if (!key || !iv || !ciphertext || !tag || !plaintext_buf) {
-        return ERROR_CRYPTO;
-    }
-    
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return ERROR_CRYPTO;
-    }
-    
-    int len = 0;
-    int plaintext_len = 0;
-    int ret = ERROR_CRYPTO;
-    
-    /* Initialize decryption with GCM */
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
-        goto cleanup;
-    }
-    
-    /* Set IV length to 12 bytes */
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) {
-        goto cleanup;
-    }
-    
-    /* Set key and IV */
-    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) {
-        goto cleanup;
-    }
-    
-    /* Decrypt ciphertext */
-    if (EVP_DecryptUpdate(ctx, plaintext_buf, &len, ciphertext, ciphertext_len) != 1) {
-        goto cleanup;
-    }
-    plaintext_len = len;
-    
-    /* Set expected GCM tag */
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) != 1) {
-        goto cleanup;
-    }
-    
-    /* Finalize decryption and verify tag */
-    if (EVP_DecryptFinal_ex(ctx, plaintext_buf + len, &len) > 0) {
-        plaintext_len += len;
-        ret = plaintext_len;
-    } else {
-        ret = ERROR_CRYPTO; /* Decryption or tag verification failed */
-    }
-    
-cleanup:
+    if (!ctx) return -1;
+
+    int len = 0, total = 0, rc = -1;
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) goto done;
+    if (EVP_DecryptUpdate(ctx, plaintext_buf, &len, ciphertext, ciphertext_len) != 1) goto done;
+    total = len;
+    if (EVP_DecryptFinal_ex(ctx, plaintext_buf + total, &len) != 1) goto done;
+    total += len;
+    rc = total;
+
+done:
     EVP_CIPHER_CTX_free(ctx);
-    return ret;
+    if (rc < 0) ERR_print_errors_fp(stderr);
+    return rc;
 }
 
-/* Pad plaintext to MSG_PADDED_SIZE using length-prefix scheme
- * Format: [4-byte little-endian length][plaintext][random padding]
- * This allows messages up to MSG_PADDED_SIZE - 4 bytes */
+int aes_generate_iv(unsigned char *iv_buf) {
+    if (RAND_bytes(iv_buf, AES_IV_LEN) != 1) {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    return 0;
+}
+
 int msg_pad(const uint8_t *plaintext, size_t plaintext_len,
             uint8_t *padded_out) {
-    if (!plaintext || !padded_out || plaintext_len > MSG_PADDED_SIZE - 4) {
-        return ERROR_CRYPTO;
-    }
-    
-    /* Write 4-byte length prefix (little-endian) */
+    /* Layout: 4-byte LE length | message | zero padding to MSG_PADDED_SIZE */
+    if (plaintext_len > MSG_PADDED_SIZE - 4) return -1;
+
     uint32_t len32 = (uint32_t)plaintext_len;
-    padded_out[0] = (uint8_t)(len32 & 0xFF);
-    padded_out[1] = (uint8_t)((len32 >> 8) & 0xFF);
-    padded_out[2] = (uint8_t)((len32 >> 16) & 0xFF);
-    padded_out[3] = (uint8_t)((len32 >> 24) & 0xFF);
-    
-    /* Copy plaintext after length prefix */
+    memcpy(padded_out, &len32, 4);
     memcpy(padded_out + 4, plaintext, plaintext_len);
-    
-    /* Fill remaining space with random bytes for traffic analysis resistance */
-    size_t padding_start = 4 + plaintext_len;
-    size_t padding_len = MSG_PADDED_SIZE - padding_start;
-    if (padding_len > 0) {
-        RAND_bytes(padded_out + padding_start, padding_len);
-    }
-    
-    return SUCCESS;
+    memset(padded_out + 4 + plaintext_len, 0, MSG_PADDED_SIZE - 4 - plaintext_len);
+
+    return 0;
 }
 
-/* Strip padding using length-prefix scheme */
 int msg_unpad(const uint8_t *padded, size_t padded_len,
               uint8_t *plaintext_out) {
-    if (!padded || !plaintext_out || padded_len < 4) {
-        return ERROR_CRYPTO;
-    }
-    
-    /* Read 4-byte length prefix (little-endian) */
-    uint32_t len32 = (uint32_t)padded[0] |
-                     ((uint32_t)padded[1] << 8) |
-                     ((uint32_t)padded[2] << 16) |
-                     ((uint32_t)padded[3] << 24);
-    
-    /* Validate length */
-    if (len32 > padded_len - 4) {
-        return ERROR_CRYPTO;
-    }
-    
-    /* Copy plaintext (after length prefix) */
-    memcpy(plaintext_out, padded + 4, len32);
-    
-    return (int)len32;
+    if (padded_len < 4) return -1;
+
+    uint32_t plain_len;
+    memcpy(&plain_len, padded, 4);
+
+    if (plain_len > padded_len - 4) return -1;
+
+    memcpy(plaintext_out, padded + 4, plain_len);
+    plaintext_out[plain_len] = '\0';
+    return (int)plain_len;
 }

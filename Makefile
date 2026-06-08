@@ -1,234 +1,117 @@
-# Makefile for Secure Multi-Client Chat Application
-
-# Detect OS
-ifeq ($(OS),Windows_NT)
-    DETECTED_OS := Windows
-    SHELL := cmd.exe
-    RM := del /Q /F
-    RMDIR := rmdir /S /Q
-    MKDIR := mkdir
-    PATHSEP := \\
-    EXE_EXT := .exe
-	NULL_REDIRECT := nul
-    # Windows-specific flags
-    LDFLAGS_PLATFORM := -lws2_32
-    CFLAGS_PLATFORM := 
-else
-    DETECTED_OS := $(shell uname -s)
-    RM := rm -f
-    RMDIR := rm -rf
-    MKDIR := mkdir -p
-    PATHSEP := /
-    EXE_EXT :=
-	NULL_REDIRECT := /dev/null
-    # Unix-specific flags
-    LDFLAGS_PLATFORM :=
-    CFLAGS_PLATFORM :=
-endif
-
 CC      = gcc
-CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -g \
-          -I./include \
-          $(CFLAGS_PLATFORM) \
-		  $(shell pkg-config --cflags openssl 2>$(NULL_REDIRECT) || echo -I/usr/include)
-LDFLAGS = $(shell pkg-config --libs openssl 2>$(NULL_REDIRECT) || echo -lssl -lcrypto) \
-          -lpthread $(LDFLAGS_PLATFORM)
-GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>$(NULL_REDIRECT))
-GTK_LDFLAGS = $(shell pkg-config --libs gtk+-3.0 2>$(NULL_REDIRECT))
+CFLAGS  = -Wall -Wextra -std=c11 -g -I./include \
+          -D_POSIX_C_SOURCE=200809L \
+          $(shell pkg-config --cflags openssl)
+LDFLAGS = $(shell pkg-config --libs openssl) -lpthread -lrt
 
-# Source file groups
-SRC_COMMON = src/crypto/ed25519_utils.c src/crypto/prekey.c src/crypto/aes_utils.c \
-             src/crypto/dh_exchange.c src/crypto/crypto_common.c \
-             src/crypto/ratchet.c \
-             src/tls/tls_server.c src/tls/tls_client.c \
-             src/engine/adaptive_engine.c src/engine/metrics_collector.c \
-             src/engine/network_monitor.c \
-             src/transport/multipath.c src/transport/offline_queue.c \
-             src/transport/priority_queue.c \
-             src/security/intrusion.c \
-             src/net/socket_utils.c src/net/dns_resolver.c \
-             src/net/udp_notify.c src/net/message_utils.c
+SRC_COMMON = \
+    src/crypto/ratchet.c \
+    src/crypto/rsa_utils.c \
+    src/crypto/aes_utils.c \
+    src/crypto/crypto_common.c \
+    src/tls/tls_server.c \
+    src/tls/tls_client.c \
+    src/engine/adaptive_engine.c \
+    src/engine/metrics_collector.c \
+    src/transport/multipath.c \
+    src/transport/offline_queue.c \
+    src/transport/priority_queue.c \
+    src/security/intrusion.c \
+    src/net/socket_utils.c \
+    src/net/message_utils.c \
+    src/net/dns_resolver.c \
+    src/net/udp_notify.c
 
-SRC_SERVER = src/server/server.c src/server/client_handler.c \
-             src/server/room_manager.c src/server/auth_manager.c
+SRC_SERVER = \
+    src/server/server.c \
+    src/server/client_handler.c \
+    src/server/room_manager.c \
+    src/server/auth_manager.c
 
-SRC_CLIENT = src/client/client.c src/client/input_handler.c \
-             src/client/display.c
+SRC_CLIENT = \
+    src/client/client.c \
+    src/client/input_handler.c \
+    src/client/display.c
 
-SRC_GTK_CLIENT = src/client/client.c src/client/gtk_client.c
+all: dirs server client
 
-# Phase 1 - Basic TCP only (no crypto/TLS dependencies)
-SRC_PHASE1_COMMON = src/net/socket_utils.c src/net/message_utils.c
-SRC_PHASE1_SERVER = src/server/server.c  
-SRC_PHASE1_CLIENT = src/client/client.c
+dirs:
+	mkdir -p bin data/offline_queue data/keys
 
-# Object files
-OBJ_COMMON = $(SRC_COMMON:.c=.o)
-OBJ_SERVER = $(SRC_SERVER:.c=.o)
-OBJ_CLIENT = $(SRC_CLIENT:.c=.o)
-OBJ_GTK_CLIENT = src/client/client_gui.o src/client/gtk_client.o
+server: $(SRC_SERVER) $(SRC_COMMON)
+	$(CC) $(CFLAGS) -o bin/server $^ $(LDFLAGS)
 
-OBJ_PHASE1_COMMON = $(SRC_PHASE1_COMMON:.c=.o)
-OBJ_PHASE1_SERVER = $(SRC_PHASE1_SERVER:.c=.o)
-OBJ_PHASE1_CLIENT = $(SRC_PHASE1_CLIENT:.c=.o)
+client: $(SRC_CLIENT) $(SRC_COMMON)
+	$(CC) $(CFLAGS) -o bin/client $^ $(LDFLAGS)
 
-# Default target
-all: bin server client certs
+gtk-client: src/client/gtk_client.c $(SRC_CLIENT) $(SRC_COMMON)
+	$(CC) $(CFLAGS) -DHAVE_GTK \
+	    $(shell pkg-config --cflags gtk+-3.0) \
+	    -o bin/client_gtk $^ \
+	    $(LDFLAGS) $(shell pkg-config --libs gtk+-3.0)
 
-gtk-client: bin bin/client_gtk
-
-# Phase 1 targets (no crypto/TLS dependencies)
-phase1: bin phase1-server phase1-client
-
-phase1-server: bin bin/server_phase1
-
-bin/server_phase1: $(OBJ_PHASE1_SERVER) $(OBJ_PHASE1_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
-
-phase1-client: bin bin/client_phase1  
-
-bin/client_phase1: $(OBJ_PHASE1_CLIENT) $(OBJ_PHASE1_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
-
-# Create bin directory
-bin:
-ifeq ($(DETECTED_OS),Windows)
-	if not exist bin $(MKDIR) bin
-else
-	mkdir -p bin
-endif
-
-# Build server
-server: bin bin/server
-
-bin/server: $(OBJ_SERVER) $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-# Build client  
-client: bin bin/client
-
-bin/client: $(OBJ_CLIENT) $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-src/client/client_gui.o: src/client/client.c gtk-deps-check
-	$(CC) $(CFLAGS) $(GTK_CFLAGS) -DCLIENT_NO_MAIN -c $< -o $@
-
-src/client/gtk_client.o: src/client/gtk_client.c gtk-deps-check
-	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c $< -o $@
-
-.PHONY: gtk-deps-check
-gtk-deps-check:
-	@pkg-config --exists gtk+-3.0 || { \
-		echo "GTK+ 3 development headers are missing."; \
-		echo "Install them with: sudo apt-get install -y libgtk-3-dev pkg-config"; \
-		exit 1; \
-	}
-
-bin/client_gtk: $(OBJ_GTK_CLIENT) $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GTK_LDFLAGS)
-
-# Generate TLS certificates
 certs:
-ifeq ($(DETECTED_OS),Windows)
-	if not exist certs $(MKDIR) certs
-	openssl req -x509 -newkey rsa:4096 -keyout certs\server.key -out certs\server.crt -days 365 -nodes -subj "/CN=localhost"
-	copy certs\server.crt certs\ca.crt
-else
 	mkdir -p certs
 	openssl req -x509 -newkey rsa:4096 -keyout certs/server.key \
-	  -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
+	    -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
 	cp certs/server.crt certs/ca.crt
-endif
 
-# Build tests
-tests: bin bin/test_ratchet bin/test_crypto bin/test_adaptive bin/test_multipath bin/test_tls bin/test_ids bin/test_network_monitor
+tests: test_crypto test_ratchet test_adaptive test_multipath test_tls test_ids
 
-bin/test_ratchet: tests/test_ratchet.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_crypto: tests/test_crypto.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_adaptive: tests/test_adaptive.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_multipath: tests/test_multipath.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_tls: tests/test_tls.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_ids: tests/test_ids.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-bin/test_network_monitor: tests/test_network_monitor.c $(OBJ_COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-# Generic rule for object files
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Clean build artifacts
-clean:
-ifeq ($(DETECTED_OS),Windows)
-	-$(RM) src\crypto\*.o src\tls\*.o src\engine\*.o src\transport\*.o src\security\*.o src\net\*.o src\server\*.o src\client\*.o
-	-$(RM) bin\*
-else
-	rm -f $(OBJ_COMMON) $(OBJ_SERVER) $(OBJ_CLIENT)
-	rm -f $(OBJ_PHASE1_COMMON) $(OBJ_PHASE1_SERVER) $(OBJ_PHASE1_CLIENT)
-	rm -f src/client/client_gui.o src/client/gtk_client.o
-	rm -f bin/server bin/client bin/client_gtk bin/server_phase1 bin/client_phase1 bin/test_*
-endif
-
-# Clean everything including certificates
-clean-all: clean
-ifeq ($(DETECTED_OS),Windows)
-	-$(RM) certs\*
-else
-	rm -rf certs/*
-endif
-
-# Install dependencies (for Ubuntu/Debian)
-install-deps:
-	sudo apt-get update
-	sudo apt-get install -y gcc make libssl-dev pkg-config libgtk-3-dev
-
-# Run tests
-test: tests
-	@echo "\n=== Running Test Suite ==="
-	./bin/test_ratchet
+test_crypto: tests/test_crypto.c $(SRC_COMMON)
+	$(CC) $(CFLAGS) -o bin/test_crypto $^ $(LDFLAGS)
 	./bin/test_crypto
+
+test_ratchet: tests/test_ratchet.c \
+    src/crypto/ratchet.c src/crypto/crypto_common.c \
+    src/crypto/rsa_utils.c $(SRC_COMMON)
+	$(CC) $(CFLAGS) -o bin/test_ratchet tests/test_ratchet.c $(SRC_COMMON) $(LDFLAGS)
+	./bin/test_ratchet
+
+test_adaptive: tests/test_adaptive.c \
+    src/engine/adaptive_engine.c src/engine/metrics_collector.c
+	$(CC) $(CFLAGS) -o bin/test_adaptive \
+	    tests/test_adaptive.c \
+	    src/engine/adaptive_engine.c \
+	    src/engine/metrics_collector.c \
+	    $(LDFLAGS)
 	./bin/test_adaptive
+
+test_multipath: tests/test_multipath.c src/transport/multipath.c \
+    src/tls/tls_client.c src/net/udp_notify.c
+	$(CC) $(CFLAGS) -o bin/test_multipath \
+	    tests/test_multipath.c \
+	    src/transport/multipath.c \
+	    src/tls/tls_client.c \
+	    src/tls/tls_server.c \
+	    src/net/udp_notify.c \
+	    $(LDFLAGS)
 	./bin/test_multipath
+
+test_tls: tests/test_tls.c src/tls/tls_client.c src/tls/tls_server.c
+	$(CC) $(CFLAGS) -o bin/test_tls \
+	    tests/test_tls.c \
+	    src/tls/tls_client.c \
+	    src/tls/tls_server.c \
+	    $(LDFLAGS)
 	./bin/test_tls
+
+test_ids: tests/test_ids.c src/security/intrusion.c \
+    src/engine/metrics_collector.c
+	$(CC) $(CFLAGS) -o bin/test_ids \
+	    tests/test_ids.c \
+	    src/security/intrusion.c \
+	    src/engine/metrics_collector.c \
+	    $(LDFLAGS)
 	./bin/test_ids
-	./bin/test_network_monitor
-	@echo "\n=== All Tests Complete ==="
 
-# Debug build
-debug: CFLAGS += -DDEBUG -O0
-debug: all
+clean:
+	rm -f bin/*
 
-# Release build
-release: CFLAGS += -O2 -DNDEBUG
-release: all
+distclean: clean
+	rm -f certs/* data/keys/*
+	find data/offline_queue -type f -delete 2>/dev/null || true
 
-# Help
-help:
-	@echo "Available targets:"
-	@echo "  all          - Build server and client (default)"
-	@echo "  phase1       - Build Phase 1 TCP echo server and client"
-	@echo "  server       - Build server only"
-	@echo "  client       - Build client only"
-	@echo "  gtk-client   - Build GTK client only"
-	@echo "  tests        - Build test executables"
-	@echo "  certs        - Generate TLS certificates"
-	@echo "  clean        - Remove build artifacts"
-	@echo "  clean-all    - Remove build artifacts and certificates"
-	@echo "  install-deps - Install system dependencies"
-	@echo "  test         - Build and run tests"
-	@echo "  debug        - Build with debug symbols and no optimization"
-	@echo "  release      - Build optimized release version"
-	@echo "  help         - Show this help message"
-
-.PHONY: all server client gtk-client tests certs clean clean-all install-deps test debug release help phase1 phase1-server phase1-client
+.PHONY: all dirs server client gtk-client certs tests \
+        test_crypto test_ratchet test_adaptive test_multipath test_tls test_ids \
+        clean distclean

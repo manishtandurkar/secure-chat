@@ -1,185 +1,105 @@
-#define _POSIX_C_SOURCE 200809L
-#include "platform_compat.h"
-#include "multipath.h"
-#include "network_monitor.h"
-#include "message.h"
-#include "tls_layer.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <openssl/rand.h>
+#include "multipath.h"
+#include "tls_layer.h"
+#include "udp_notify.h"
+#include "common.h"
+#include "platform_compat.h"
 
-/* Deduplication ring buffer */
-static uint8_t dedup_buffer[DEDUP_WINDOW][MSG_ID_LEN];
-static int dedup_index = 0;
-static pthread_mutex_t dedup_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Dedup ring buffer */
+static uint8_t  dedup_buf[DEDUP_WINDOW][MSG_ID_LEN];
+static int      dedup_idx    = 0;
+static int      dedup_filled = 0;
+static pthread_mutex_t dedup_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Add message ID to dedup set */
-void dedup_add(uint8_t id[MSG_ID_LEN]) {
-    pthread_mutex_lock(&dedup_mutex);
-    
-    memcpy(dedup_buffer[dedup_index], id, MSG_ID_LEN);
-    dedup_index = (dedup_index + 1) % DEDUP_WINDOW;
-    
-    pthread_mutex_unlock(&dedup_mutex);
+void dedup_init(void) {
+    pthread_mutex_lock(&dedup_lock);
+    memset(dedup_buf, 0, sizeof(dedup_buf));
+    dedup_idx    = 0;
+    dedup_filled = 0;
+    pthread_mutex_unlock(&dedup_lock);
 }
 
-/* Check if message ID seen before */
 int dedup_check(const uint8_t id[MSG_ID_LEN]) {
-    pthread_mutex_lock(&dedup_mutex);
-    
-    for (int i = 0; i < DEDUP_WINDOW; i++) {
-        if (memcmp(dedup_buffer[i], id, MSG_ID_LEN) == 0) {
-            pthread_mutex_unlock(&dedup_mutex);
-            return 1; /* Duplicate */
+    pthread_mutex_lock(&dedup_lock);
+    int window = dedup_filled ? DEDUP_WINDOW : dedup_idx;
+    for (int i = 0; i < window; i++) {
+        if (memcmp(dedup_buf[i], id, MSG_ID_LEN) == 0) {
+            pthread_mutex_unlock(&dedup_lock);
+            return 1;
         }
     }
-    
-    pthread_mutex_unlock(&dedup_mutex);
-    return 0; /* New message */
+    pthread_mutex_unlock(&dedup_lock);
+    return 0;
 }
 
-/* Send over both TCP and UDP with path-intelligence ordering */
+void dedup_add(uint8_t id[MSG_ID_LEN]) {
+    pthread_mutex_lock(&dedup_lock);
+    memcpy(dedup_buf[dedup_idx], id, MSG_ID_LEN);
+    dedup_idx = (dedup_idx + 1) % DEDUP_WINDOW;
+    if (!dedup_filled && dedup_idx == 0) dedup_filled = 1;
+    pthread_mutex_unlock(&dedup_lock);
+}
+
+static int rand_delay_ms(void) {
+    return 100 + (rand() % 401);  /* 100–500 ms */
+}
+
 int multipath_send(SSL *ssl, int udp_fd,
                    const struct sockaddr_in *udp_dest,
                    const void *payload, size_t payload_len,
                    uint8_t priority,
                    const EngineState *engine) {
-    (void)priority; /* Currently used for future priority-aware queuing */
-    if (!ssl || !payload || !engine) {
-        return ERROR_NETWORK;
+    int tcp_ok = 0, udp_ok = 0;
+    int retries = (priority == PRIORITY_CRITICAL) ?
+                      engine->max_retries + 2 : engine->max_retries;
+
+    for (int attempt = 0; attempt < retries; attempt++) {
+        if (!tcp_ok && ssl) {
+            uint32_t plen_net = htonl((uint32_t)payload_len);
+            if (tls_send(ssl, &plen_net, 4) > 0 &&
+                tls_send(ssl, payload, (int)payload_len) > 0)
+                tcp_ok = 1;
+        }
+
+        if (!udp_ok && udp_fd >= 0 && udp_dest && engine->use_udp_backup) {
+            if (udp_send(udp_fd, udp_dest, payload, payload_len) > 0)
+                udp_ok = 1;
+        }
+
+        if (tcp_ok) break;
+
+        int delay = engine->random_delay ? rand_delay_ms() : engine->retry_delay_ms;
+        sleep_ms(delay);
     }
-    
-    int tcp_success = 0;
-    int udp_success = 0;
-    
-    /* Determine preferred path based on transport health */
-    PreferredPath pref = multipath_preferred_path();
-    
-    /* Attempt sends with retries */
-    for (int attempt = 0; attempt < engine->max_retries; attempt++) {
-        struct timespec t_start, t_end;
-        
-        /* --- TCP send (preferred or both) --- */
-        if (!tcp_success && (pref == PATH_TCP || pref == PATH_BOTH)) {
-#ifdef CLOCK_MONOTONIC
-            clock_gettime(CLOCK_MONOTONIC, &t_start);
-#endif
-            int tcp_ok = (tls_send(ssl, payload, (int)payload_len) > 0);
-#ifdef CLOCK_MONOTONIC
-            clock_gettime(CLOCK_MONOTONIC, &t_end);
-            uint32_t lat_ms = (uint32_t)(
-                (t_end.tv_sec  - t_start.tv_sec)  * 1000 +
-                (t_end.tv_nsec - t_start.tv_nsec) / 1000000);
-#else
-            uint32_t lat_ms = 0;
-#endif
-            metrics_record_tcp_send(tcp_ok, lat_ms);
-            if (tcp_ok) tcp_success = 1;
-        }
-        
-        /* --- UDP send (backup or both or preferred when TCP unhealthy) --- */
-        if (!udp_success && engine->use_udp_backup &&
-            udp_fd >= 0 && udp_dest &&
-            (pref == PATH_UDP || pref == PATH_BOTH)) {
-#ifdef CLOCK_MONOTONIC
-            clock_gettime(CLOCK_MONOTONIC, &t_start);
-#endif
-            int udp_ok = (sendto(udp_fd, (const char *)payload, (int)payload_len, 0,
-                                 (struct sockaddr *)udp_dest,
-                                 sizeof(*udp_dest)) > 0);
-#ifdef CLOCK_MONOTONIC
-            clock_gettime(CLOCK_MONOTONIC, &t_end);
-            uint32_t lat_ms = (uint32_t)(
-                (t_end.tv_sec  - t_start.tv_sec)  * 1000 +
-                (t_end.tv_nsec - t_start.tv_nsec) / 1000000);
-#else
-            uint32_t lat_ms = 0;
-#endif
-            metrics_record_udp_send(udp_ok, lat_ms);
-            if (udp_ok) udp_success = 1;
-        }
-        
-        /* --- Fallback: try non-preferred path if preferred failed --- */
-        if (!tcp_success && !udp_success) {
-            /* Try TCP regardless of preference */
-            if (!tcp_success) {
-                int tcp_ok = (tls_send(ssl, payload, (int)payload_len) > 0);
-                metrics_record_tcp_send(tcp_ok, 0);
-                if (tcp_ok) tcp_success = 1;
-            }
-            /* Try UDP regardless of preference */
-            if (!udp_success && engine->use_udp_backup && udp_fd >= 0 && udp_dest) {
-                int udp_ok = (sendto(udp_fd, (const char *)payload, (int)payload_len, 0,
-                                     (struct sockaddr *)udp_dest,
-                                     sizeof(*udp_dest)) > 0);
-                metrics_record_udp_send(udp_ok, 0);
-                if (udp_ok) udp_success = 1;
-            }
-        }
-        
-        /* If either succeeded, record bytes and stop retrying */
-        if (tcp_success || udp_success) {
-            metrics_record_tx_bytes(payload_len);
-            metrics_record_delivery(1);
-            break;
-        }
-        
-        /* Apply delay based on engine config */
-        if (engine->random_delay) {
-            int delay_ms = 100 + (rand() % 400); /* 100–500ms */
-            struct timespec req = {
-                .tv_sec = delay_ms / 1000,
-                .tv_nsec = (delay_ms % 1000) * 1000000
-            };
-            nanosleep(&req, NULL);
-        } else {
-            struct timespec req = {
-                .tv_sec = engine->retry_delay_ms / 1000,
-                .tv_nsec = (engine->retry_delay_ms % 1000) * 1000000
-            };
-            nanosleep(&req, NULL);
-        }
-    }
-    
-    if (!tcp_success && !udp_success) {
-        metrics_record_delivery(0); /* Undelivered */
-    }
-    
-    return (tcp_success || udp_success) ? SUCCESS : ERROR_NETWORK;
+
+    return (tcp_ok || udp_ok) ? 0 : -1;
 }
 
-/* Receive from either TCP or UDP with deduplication */
 int multipath_recv(SSL *ssl, int udp_fd,
                    void *payload_out, size_t buf_len,
                    uint8_t *msg_id_out) {
-    /* Simplified implementation - in production would use select/poll */
+    if (!ssl) return -1;
+
+    uint32_t plen_net = 0;
+    if (tls_recv(ssl, &plen_net, 4) < 0) return -1;
+
+    uint32_t plen = ntohl(plen_net);
+    if (plen > buf_len || plen > (uint32_t)(MSG_PADDED_SIZE + 64)) {
+        fprintf(stderr, "multipath_recv: payload too large %u\n", plen);
+        return -1;
+    }
+
+    if (tls_recv(ssl, payload_out, (int)plen) < 0) return -1;
+
+    /* msg_id_out is managed by caller from message header */
+    (void)msg_id_out;
     (void)udp_fd;
-    if (!ssl || !payload_out) {
-        return ERROR_NETWORK;
-    }
-    
-    /* Try TCP first */
-    int n = tls_recv(ssl, payload_out, buf_len);
-    if (n > 0) {
-        /* Extract message ID from header if present */
-        if (msg_id_out && (size_t)n >= sizeof(MsgHeader)) {
-            MsgHeader *hdr = (MsgHeader *)payload_out;
-            memcpy(msg_id_out, hdr->msg_id, MSG_ID_LEN);
-            
-            /* Check for duplicate */
-            if (dedup_check(hdr->msg_id)) {
-                return 0; /* Duplicate, discard silently */
-            }
-            
-            /* Add to dedup set */
-            dedup_add(hdr->msg_id);
-        }
-        
-        return n;
-    }
-    
-    return ERROR_NETWORK;
+
+    return (int)plen;
 }

@@ -1,859 +1,411 @@
-/**
- * Full Protocol Client with TLS, E2EE Signal-style PreKey + X3DH, Double Ratchet, and Multi-Path
- * Implements modern end-to-end encrypted chat operations
- */
-
-#define _POSIX_C_SOURCE 200809L
-#include "platform_compat.h"
-#include "client.h"
-#include "crypto.h"
-#include "prekey.h"
-#include "message.h"
-#include "ratchet.h"
-#include "adaptive_engine.h"
-#include "priority_queue.h"
-#include "socket_utils.h"
-#include "dns_resolver.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <stdarg.h>
-#include <signal.h>
-#include <time.h>
-#include <openssl/evp.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
 #include <openssl/rand.h>
-#include <openssl/sha.h>
+#include "client.h"
+#include "socket_utils.h"
+#include "tls_layer.h"
+#include "ratchet.h"
+#include "crypto.h"
+#include "message.h"
+#include "priority_queue.h"
+#include "multipath.h"
+#include "dns_resolver.h"
+#include "common.h"
+#include "platform_compat.h"
 
-#ifndef PLATFORM_WINDOWS
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#endif
+/* Forward declarations for display functions */
+void display_message(const char *sender, const char *text, uint8_t priority);
+void display_system(const char *msg);
+void display_users(const char *user_list);
+void *input_thread_func(void *arg);
 
-/* Global client state for signal handlers */
-static ClientState *g_client = NULL;
-static ClientLogCallback g_log_callback = NULL;
-static void *g_log_user_data = NULL;
+static ClientContext *g_ctx = NULL;
 
-/* Cache Alice's original X3DH keys to pass in E2EE payloads */
-static uint8_t g_alice_dh_id_pub[32] = {0};
-static uint8_t g_alice_ephem_pub[32] = {0};
-static int g_has_x3dh_cached = 0;
+static int crypto_verbose(void) { return 1; }
 
-void client_set_log_callback(ClientLogCallback callback, void *user_data) {
-    g_log_callback = callback;
-    g_log_user_data = user_data;
+static void log_hex(const char *label, const uint8_t *buf, size_t len) {
+    size_t show = len < 32 ? len : 32;
+    fprintf(stderr, "%s", label);
+    for (size_t i = 0; i < show; i++) fprintf(stderr, "%02x", buf[i]);
+    if (len > 32) fprintf(stderr, "...[%zu bytes total]", len);
+    fprintf(stderr, "\n");
 }
 
-static void client_log_line(const char *line) {
-    if (g_log_callback) {
-        g_log_callback(line, g_log_user_data);
-        return;
-    }
-    printf("%s\n", line);
-    fflush(stdout);
+/* Called from input_handler.c for /users command */
+int client_request_user_list_g(void) {
+    if (!g_ctx || !g_ctx->ssl) return -1;
+    return client_request_user_list(g_ctx);
 }
 
-static void client_log_format(const char *format, ...) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    client_log_line(buffer);
-}
+/* Recv thread: reads from TLS, decrypts, displays */
+static void *recv_thread(void *arg) {
+    ClientContext *ctx = (ClientContext *)arg;
+    MsgHeader hdr;
+    uint8_t   payload[MSG_PADDED_SIZE + 256];
 
-void handle_shutdown(int sig) {
-    (void)sig;
-    if (g_client) {
-        g_client->running = 0;
-    }
-}
+    while (ctx->running) {
+        memset(&hdr, 0, sizeof(hdr));
+        if (recv_message(ctx->ssl, &hdr, payload, sizeof(payload)) < 0) {
+            if (ctx->running) fprintf(stderr, "[CLIENT] Connection lost\n");
+            ctx->running = 0;
+            break;
+        }
 
-int is_duplicate(ClientState *client, const uint8_t *msg_id) {
-    for (int i = 0; i < DEDUP_WINDOW; i++) {
-        if (memcmp(client->dedup_set[i], msg_id, MSG_ID_LEN) == 0) {
-            return 1;
+        switch (hdr.msg_type) {
+        case MSG_CHAT: {
+            if (hdr.payload_len < AES_IV_LEN) break;
+
+            /* Dedup check */
+            if (dedup_check(hdr.msg_id)) break;
+            dedup_add(hdr.msg_id);
+
+            uint8_t *iv         = payload;
+            uint8_t *ciphertext = payload + AES_IV_LEN;
+            int      ct_len     = (int)(hdr.payload_len - AES_IV_LEN);
+
+            if (crypto_verbose())
+                log_hex("[CLIENT-RECV]   Ciphertext: ", ciphertext, (size_t)ct_len);
+
+            uint8_t msg_key[RATCHET_KEY_LEN];
+            ratchet_recv_step(&ctx->ratchet, msg_key);
+
+            uint8_t padded[MSG_PADDED_SIZE + 16];
+            int     dec_len = aes_decrypt(msg_key, iv, ciphertext, ct_len, padded);
+            OPENSSL_cleanse(msg_key, sizeof(msg_key));
+            if (dec_len < 0) break;
+
+            uint8_t plain[MSG_PADDED_SIZE + 1];
+            int plain_len = msg_unpad(padded, (size_t)dec_len, plain);
+            if (plain_len < 0) break;
+            plain[plain_len] = '\0';
+
+            if (crypto_verbose())
+                fprintf(stderr, "[CLIENT-RECV]   Decrypted:  \"%s\"\n", (char *)plain);
+
+            /* Parse "sender\nmessage" */
+            char sender[MAX_USERNAME_LEN + 1] = "peer";
+            const char *msg_text = (char *)plain;
+            char *nl = memchr(plain, '\n', (size_t)plain_len);
+            if (nl) {
+                size_t slen = (size_t)(nl - (char *)plain);
+                if (slen < MAX_USERNAME_LEN) {
+                    memcpy(sender, plain, slen);
+                    sender[slen] = '\0';
+                }
+                msg_text = nl + 1;
+            }
+
+            if (ctx->message_callback)
+                ctx->message_callback(sender, msg_text, hdr.priority, hdr.flags);
+            else
+                display_message(sender, msg_text, hdr.priority);
+            break;
+        }
+
+        case MSG_OFFLINE_STORED: {
+            payload[hdr.payload_len] = '\0';
+            char sys_msg[MAX_USERNAME_LEN + 64];
+            snprintf(sys_msg, sizeof(sys_msg),
+                     "Message queued for offline user: %.32s", (char *)payload);
+            if (ctx->system_callback)
+                ctx->system_callback(sys_msg);
+            else
+                printf("[QUEUE] %s\n", sys_msg);
+            break;
+        }
+
+        case MSG_USER_LIST_RESP:
+            payload[hdr.payload_len] = '\0';
+            display_users((char *)payload);
+            if (ctx->users_callback) ctx->users_callback((char *)payload);
+            break;
+
+        case MSG_ENGINE_STATE:
+            if (hdr.payload_len >= 1)
+                printf("[ENGINE] Server mode: %d\n", payload[0]);
+            break;
+
+        case MSG_ERROR:
+            payload[hdr.payload_len] = '\0';
+            fprintf(stderr, "[ERROR] %s\n", (char *)payload);
+            break;
+
+        default:
+            break;
         }
     }
-    return 0;
+    return NULL;
 }
 
-void add_to_dedup(ClientState *client, const uint8_t *msg_id) {
-    memcpy(client->dedup_set[client->dedup_idx], msg_id, MSG_ID_LEN);
-    client->dedup_idx = (client->dedup_idx + 1) % DEDUP_WINDOW;
+/* Send thread: drains priority queue, encrypts, sends */
+static void *send_thread(void *arg) {
+    ClientContext *ctx = (ClientContext *)arg;
+
+    while (ctx->running) {
+        QueuedMessage *qm = pq_dequeue();
+        if (!qm) continue;
+
+        /* Encrypt the full "recipient\nmessage" payload so server can route it */
+        const char *text = (char *)qm->payload;
+
+        /* Pad plaintext — includes recipient prefix so server can parse */
+        uint8_t padded[MSG_PADDED_SIZE];
+        if (msg_pad((const uint8_t *)text, strlen(text), padded) < 0) continue;
+
+        /* Get msg key */
+        uint8_t msg_key[RATCHET_KEY_LEN];
+        ratchet_send_step(&ctx->ratchet, msg_key);
+
+        /* Encrypt */
+        uint8_t iv[AES_IV_LEN];
+        aes_generate_iv(iv);
+
+        uint8_t ciphertext[MSG_PADDED_SIZE + 32];
+        int ct_len = aes_encrypt(msg_key, iv, padded, MSG_PADDED_SIZE, ciphertext);
+        OPENSSL_cleanse(msg_key, sizeof(msg_key));
+        if (ct_len < 0) continue;
+
+        if (crypto_verbose()) {
+            fprintf(stderr, "\n[CLIENT-SEND] E2EE encrypt:\n");
+            fprintf(stderr, "[CLIENT-SEND]   Plaintext:  \"%s\"\n", text);
+            log_hex("[CLIENT-SEND]   Ciphertext: ", ciphertext, (size_t)ct_len);
+        }
+
+        /* Build payload: IV + ciphertext */
+        uint8_t wire_payload[AES_IV_LEN + MSG_PADDED_SIZE + 32];
+        memcpy(wire_payload, iv, AES_IV_LEN);
+        memcpy(wire_payload + AES_IV_LEN, ciphertext, (size_t)ct_len);
+        size_t wire_len = AES_IV_LEN + (size_t)ct_len;
+
+        uint8_t msg_id[MSG_ID_LEN];
+        RAND_bytes(msg_id, MSG_ID_LEN);
+
+        send_message(ctx->ssl, MSG_CHAT, qm->priority,
+                     0, msg_id, wire_payload, (uint32_t)wire_len);
+
+        /* DH ratchet step based on engine config */
+        if ((ctx->ratchet.send_counter % (uint32_t)ctx->engine.dh_ratchet_freq) == 0) {
+            uint8_t pub_bytes[32];
+            size_t  pub_len = sizeof(pub_bytes);
+            if (ratchet_get_dh_pubkey_bytes(&ctx->ratchet, pub_bytes, pub_len, &pub_len) == 0) {
+                RAND_bytes(msg_id, MSG_ID_LEN);
+                send_message(ctx->ssl, MSG_RATCHET_DH, PRIORITY_NORMAL,
+                             0, msg_id, pub_bytes, (uint32_t)pub_len);
+            }
+        }
+    }
+    return NULL;
 }
 
-int client_init(ClientState *client, const char *hostname, int port, const char *username) {
-    memset(client, 0, sizeof(ClientState));
-    strncpy(client->username, username, MAX_USERNAME_LEN - 1);
-    client->running = 1;
-    pthread_mutex_init(&client->ratchet_lock, NULL);
-
+int client_connect(ClientContext *ctx,
+                   const char *host, int port, const char *username) {
     /* Resolve hostname */
-    char ip_str[INET_ADDRSTRLEN];
-    if (dns_resolve(hostname, ip_str, sizeof(ip_str)) != 0) {
-        fprintf(stderr, "DNS resolution failed for %s\n", hostname);
-        return -1;
+    char ip_str[64];
+    if (dns_resolve(host, ip_str, sizeof(ip_str)) < 0) {
+        strncpy(ip_str, host, sizeof(ip_str) - 1);
     }
 
-    /* Create TCP socket */
-    client->tcp_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (client->tcp_socket < 0) {
-        perror("socket");
-        return -1;
+    int sockfd = socket_create_client(ip_str, port);
+    if (sockfd < 0) return -1;
+
+    SSL_CTX *ssl_ctx = tls_create_client_ctx("certs/ca.crt");
+    if (!ssl_ctx) { close(sockfd); return -1; }
+
+    ctx->ssl = tls_wrap_client_socket(ssl_ctx, sockfd, host);
+    SSL_CTX_free(ssl_ctx);
+    if (!ctx->ssl) { close(sockfd); return -1; }
+
+    strncpy(ctx->username, username, MAX_USERNAME_LEN - 1);
+    ctx->running = 1;
+
+    /* DH handshake */
+    EVP_PKEY *dh_kp = dh_generate_keypair();
+    if (!dh_kp) { tls_close(ctx->ssl); return -1; }
+
+    uint8_t our_pub[32];
+    size_t  our_pub_len = sizeof(our_pub);
+    EVP_PKEY_get_raw_public_key(dh_kp, our_pub, &our_pub_len);
+
+    uint8_t msg_id[MSG_ID_LEN];
+    RAND_bytes(msg_id, MSG_ID_LEN);
+    send_message(ctx->ssl, MSG_DH_INIT, PRIORITY_NORMAL, 0, msg_id,
+                 our_pub, (uint32_t)our_pub_len);
+
+    /* Receive server DH pubkey */
+    MsgHeader hdr;
+    uint8_t   payload[256];
+    if (recv_message(ctx->ssl, &hdr, payload, sizeof(payload)) < 0) {
+        EVP_PKEY_free(dh_kp); tls_close(ctx->ssl); return -1;
+    }
+    if (hdr.msg_type != MSG_DH_RESP) {
+        EVP_PKEY_free(dh_kp); tls_close(ctx->ssl); return -1;
     }
 
-    memset(&client->server_addr, 0, sizeof(client->server_addr));
-    client->server_addr.sin_family = AF_INET;
-    client->server_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip_str, &client->server_addr.sin_addr) <= 0) {
-        perror("inet_pton");
-        close(client->tcp_socket);
-        return -1;
+    EVP_PKEY *server_pub = ratchet_pubkey_from_bytes(payload, hdr.payload_len);
+    if (!server_pub) { EVP_PKEY_free(dh_kp); tls_close(ctx->ssl); return -1; }
+
+    uint8_t shared[64];
+    size_t  shared_len = sizeof(shared);
+    if (dh_compute_shared_secret(dh_kp, server_pub, shared, &shared_len) < 0) {
+        EVP_PKEY_free(dh_kp); EVP_PKEY_free(server_pub); tls_close(ctx->ssl); return -1;
     }
+    EVP_PKEY_free(dh_kp);
+    EVP_PKEY_free(server_pub);
 
-    if (connect(client->tcp_socket, (struct sockaddr *)&client->server_addr, sizeof(client->server_addr)) < 0) {
-        perror("connect");
-        close(client->tcp_socket);
-        return -1;
+    if (ratchet_init(&ctx->ratchet, shared, shared_len, 1 /* initiator */) < 0) {
+        OPENSSL_cleanse(shared, sizeof(shared)); tls_close(ctx->ssl); return -1;
     }
+    OPENSSL_cleanse(shared, sizeof(shared));
 
-    client_log_format("[+] Connected to %s:%d", ip_str, port);
+    /* RSA keypair for auth */
+    EVP_PKEY *rsa_key = rsa_generate_keypair();
+    if (!rsa_key) { tls_close(ctx->ssl); return -1; }
 
-    client->ssl_ctx = tls_create_client_ctx("certs/ca.crt");
-    if (!client->ssl_ctx) {
-        fprintf(stderr, "Failed to create TLS context\n");
-        close(client->tcp_socket);
-        return -1;
-    }
+    char pem_pubkey[4096] = {0};
+    rsa_pubkey_to_pem(rsa_key, pem_pubkey, sizeof(pem_pubkey));
 
-    client->ssl = tls_wrap_client_socket(client->ssl_ctx, client->tcp_socket, hostname);
-    if (!client->ssl) {
-        fprintf(stderr, "TLS handshake failed\n");
-        tls_free_ctx(client->ssl_ctx);
-        close(client->tcp_socket);
-        return -1;
-    }
+    uint8_t sig[512];
+    size_t  sig_len = sizeof(sig);
+    rsa_sign(rsa_key, (uint8_t *)username, strlen(username), sig, &sig_len);
+    EVP_PKEY_free(rsa_key);
 
-    client_log_line("[+] TLS 1.3 handshake complete");
+    /* Auth payload: username(32) + pubkey_pem(2048) + sig(512) + sig_len(4) */
+    uint8_t auth_payload[MAX_USERNAME_LEN + 2048 + 512 + 4];
+    memset(auth_payload, 0, sizeof(auth_payload));
+    strncpy((char *)auth_payload, username, MAX_USERNAME_LEN - 1);
+    strncpy((char *)auth_payload + MAX_USERNAME_LEN, pem_pubkey, 2047);
+    uint32_t sig_len_net = htonl((uint32_t)sig_len);
+    memcpy(auth_payload + MAX_USERNAME_LEN + 2048, &sig_len_net, 4);
+    memcpy(auth_payload + MAX_USERNAME_LEN + 2048 + 4, sig, sig_len);
 
-    /* Generate Client Identity and DH Keypairs and OTPKs bundle */
-    PreKeyBundle bundle;
-    EVP_PKEY *id_key = NULL;
-    EVP_PKEY *dh_id_key = NULL;
-    EVP_PKEY *spk_key = NULL;
-    EVP_PKEY **otpk_arr = NULL;
+    RAND_bytes(msg_id, MSG_ID_LEN);
+    send_message(ctx->ssl, MSG_AUTH_REQ, PRIORITY_NORMAL, 0, msg_id,
+                 auth_payload, (uint32_t)sizeof(auth_payload));
 
-    if (prekey_generate_bundle(&bundle, &id_key, &dh_id_key, &spk_key, &otpk_arr) != SUCCESS) {
-        fprintf(stderr, "Failed to generate PreKey bundle\n");
-        tls_close(client->ssl);
-        tls_free_ctx(client->ssl_ctx);
-        close(client->tcp_socket);
-        return -1;
-    }
-
-    client->identity_keypair = id_key;
-    client->dh_identity_keypair = dh_id_key;
-    client->signed_prekey_keypair = spk_key;
-    client->otpk_keys = otpk_arr;
-
-    /* Upload PreKeyBundle to server */
-    MsgHeader upload_hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_PREKEY_UPLOAD,
-        .priority = PRIORITY_NORMAL,
-        .flags = 0,
-        .payload_len = htonl(sizeof(PreKeyBundle)),
-        .checksum = 0
-    };
-    generate_random_bytes(upload_hdr.msg_id, MSG_ID_LEN);
-
-    if (tls_send(client->ssl, &upload_hdr, sizeof(upload_hdr)) != sizeof(upload_hdr) ||
-        tls_send(client->ssl, &bundle, sizeof(PreKeyBundle)) != sizeof(PreKeyBundle)) {
-        fprintf(stderr, "Failed to upload PreKey Bundle\n");
-        EVP_PKEY_free(id_key);
-        EVP_PKEY_free(dh_id_key);
-        EVP_PKEY_free(spk_key);
-        for (int i = 0; i < OTPK_COUNT; i++) EVP_PKEY_free(otpk_arr[i]);
-        free(otpk_arr);
-        client->identity_keypair = NULL;
-        client->dh_identity_keypair = NULL;
-        client->signed_prekey_keypair = NULL;
-        client->otpk_keys = NULL;
-        return -1;
-    }
-
-    client_log_line("[+] PreKey Bundle uploaded successfully to server");
-
-    client->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (client->udp_socket < 0) {
-        client->udp_socket = -1;
-    }
-
-    memset(client->dedup_set, 0, sizeof(client->dedup_set));
-    client->dedup_idx = 0;
-    client->dh_ratchet_freq = 10;
-    client->has_pending_prekey = 0;
-    pthread_cond_init(&client->prekey_cond, NULL);
-
-    return 0;
-}
-
-int perform_dh_exchange(ClientState *client) {
-    /* DH exchange is now handled end-to-end via X3DH PreKey agreement.
-     * Retaining signature function to conform to headers but returns success */
-    (void)client;
-    return 0;
-}
-
-/* Authenticate using challenge-response signature of server challenge */
-int authenticate_with_server(ClientState *client) {
-    /* Receive Auth Challenge payload from server (32 random bytes) */
-    MsgHeader challenge_hdr;
-    if (tls_recv(client->ssl, &challenge_hdr, sizeof(challenge_hdr)) != sizeof(challenge_hdr)) {
-        fprintf(stderr, "Failed to read auth challenge header\n");
-        return -1;
-    }
-
-    if (challenge_hdr.msg_type != MSG_AUTH_REQ) {
-        fprintf(stderr, "Unexpected challenge type: %d\n", challenge_hdr.msg_type);
-        return -1;
-    }
-
-    uint32_t payload_len = ntohl(challenge_hdr.payload_len);
-    if (payload_len != 32) {
-        fprintf(stderr, "Invalid challenge payload length: %u\n", payload_len);
-        return -1;
-    }
-
-    uint8_t challenge[32];
-    if (tls_recv(client->ssl, challenge, 32) != 32) {
-        fprintf(stderr, "Failed to read challenge bytes\n");
-        return -1;
-    }
-
-    /* Sign challenge with client's Ed25519 Identity private key */
-    AuthRequest auth_req;
-    memset(&auth_req, 0, sizeof(AuthRequest));
-    strncpy(auth_req.username, client->username, MAX_USERNAME_LEN - 1);
-    
-    time_t now = time(NULL);
-    uint64_t timestamp_ms = (uint64_t)now * 1000;
-    auth_req.timestamp = htobe64(timestamp_ms);
-    
-    size_t sig_len = 64;
-    if (ed25519_sign(client->identity_keypair, challenge, 32, auth_req.signature, &sig_len) != SUCCESS || sig_len != 64) {
-        fprintf(stderr, "Failed to compute Ed25519 auth signature\n");
-        return -1;
-    }
-    auth_req.sig_len = sig_len;
-
-    /* Send response */
-    MsgHeader resp_hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_AUTH_REQ,
-        .priority = PRIORITY_NORMAL,
-        .flags = 0,
-        .payload_len = htonl(sizeof(AuthRequest)),
-        .checksum = 0
-    };
-    generate_random_bytes(resp_hdr.msg_id, MSG_ID_LEN);
-
-    if (tls_send(client->ssl, &resp_hdr, sizeof(resp_hdr)) != sizeof(resp_hdr) ||
-        tls_send(client->ssl, &auth_req, sizeof(AuthRequest)) != sizeof(AuthRequest)) {
-        fprintf(stderr, "Failed to send auth signature response\n");
-        return -1;
-    }
-
-    /* Read OK response */
-    MsgHeader status_hdr;
-    if (tls_recv(client->ssl, &status_hdr, sizeof(status_hdr)) != sizeof(status_hdr)) {
-        return -1;
-    }
-
-    if (status_hdr.msg_type == MSG_AUTH_OK) {
-        client_log_line("[+] Challenge-Response Authentication Successful");
-        return 0;
-    }
-
-    fprintf(stderr, "Challenge-Response Authentication Failed!\n");
-    return -1;
-}
-
-static void trigger_dh_ratchet_if_needed(ClientState *client) {
-    pthread_mutex_lock(&client->ratchet_lock);
-    uint32_t send_count = client->ratchet.send_counter;
-    pthread_mutex_unlock(&client->ratchet_lock);
-
-    if (send_count == 0 || (send_count % (uint32_t)client->dh_ratchet_freq) != 0) {
-        return;
-    }
-
-    EVP_PKEY *new_keypair = dh_generate_keypair();
-    if (!new_keypair) return;
-
-    uint8_t new_pubkey[32];
-    size_t pubkey_len = 32;
-    if (dh_get_public_key(new_keypair, new_pubkey, &pubkey_len) != SUCCESS) {
-        EVP_PKEY_free(new_keypair);
-        return;
-    }
-
-    pthread_mutex_lock(&client->ratchet_lock);
-    if (client->ratchet.dh_keypair) EVP_PKEY_free(client->ratchet.dh_keypair);
-    client->ratchet.dh_keypair = new_keypair;
-    pthread_mutex_unlock(&client->ratchet_lock);
-
-    MsgHeader hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_RATCHET_DH,
-        .priority = PRIORITY_NORMAL,
-        .payload_len = htonl(32)
-    };
-    generate_random_bytes(hdr.msg_id, MSG_ID_LEN);
-
-    tls_send(client->ssl, &hdr, sizeof(hdr));
-    tls_send(client->ssl, new_pubkey, 32);
-}
-
-void *recv_thread_func(void *arg) {
-    ClientState *client = (ClientState *)arg;
-    E2EEChatPayload chat_payload;
-
-    while (client->running) {
-        MsgHeader hdr;
-        int ret = tls_recv(client->ssl, &hdr, sizeof(hdr));
-        
-        if (ret <= 0) {
-            if (client->running) {
-                fprintf(stderr, "[!] Connection closed by server\n");
-                client->running = 0;
-            }
-            break;
+    /* Wait synchronously for auth response before spawning threads */
+    {
+        MsgHeader   auth_hdr;
+        uint8_t     auth_resp[512];
+        if (recv_message(ctx->ssl, &auth_hdr, auth_resp, sizeof(auth_resp)) < 0) {
+            tls_close(ctx->ssl); return -1;
         }
-
-        if (ret != sizeof(hdr)) {
-            continue;
+        if (auth_hdr.msg_type == MSG_AUTH_FAIL) {
+            strncpy(ctx->connect_error, "Authentication failed",
+                    sizeof(ctx->connect_error) - 1);
+            tls_close(ctx->ssl); return -1;
         }
-
-        if (is_duplicate(client, hdr.msg_id)) {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len > 0) {
-                uint8_t *discard = malloc(payload_len);
-                if (discard) { tls_recv(client->ssl, discard, payload_len); free(discard); }
-            }
-            continue;
+        if (auth_hdr.msg_type == MSG_ERROR) {
+            auth_resp[auth_hdr.payload_len] = '\0';
+            strncpy(ctx->connect_error, (char *)auth_resp,
+                    sizeof(ctx->connect_error) - 1);
+            tls_close(ctx->ssl); return -1;
         }
-        add_to_dedup(client, hdr.msg_id);
-
-        if (hdr.msg_type == MSG_CHAT) {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len != sizeof(E2EEChatPayload)) {
-                fprintf(stderr, "[!] Invalid E2EE payload length: %u\n", payload_len);
-                continue;
-            }
-
-            if (tls_recv(client->ssl, &chat_payload, sizeof(E2EEChatPayload)) != sizeof(E2EEChatPayload)) {
-                fprintf(stderr, "[!] Failed to receive E2EE chat payload\n");
-                continue;
-            }
-
-            pthread_mutex_lock(&client->ratchet_lock);
-
-            /* responder X3DH initialization if session is not active */
-            if (!client->ratchet.dh_keypair) {
-                uint8_t shared_secret[32];
-                /* Bob uses his own Identity Priv, DH Identity Priv, Signed PreKey Priv, and OTPK 0 */
-                if (prekey_compute_x3dh_responder(client->identity_keypair,
-                                                  client->dh_identity_keypair,
-                                                  client->signed_prekey_keypair,
-                                                  client->otpk_keys[0], /* Use our first OTPK */
-                                                  chat_payload.alice_dh_identity_pub,
-                                                  chat_payload.alice_ephemeral_pub,
-                                                  shared_secret) != SUCCESS) {
-                    pthread_mutex_unlock(&client->ratchet_lock);
-                    fprintf(stderr, "[!] Bob X3DH derivation failed on incoming E2EE message\n");
-                    continue;
-                }
-
-                if (ratchet_init(&client->ratchet, shared_secret, 32, 0) != SUCCESS) {
-                    pthread_mutex_unlock(&client->ratchet_lock);
-                    OPENSSL_cleanse(shared_secret, 32);
-                    continue;
-                }
-                OPENSSL_cleanse(shared_secret, 32);
-            }
-
-            /* Step ephemeral DR key using incoming ephemeral DR public key if new */
-            EVP_PKEY *incoming_dh = dh_pubkey_from_bytes(chat_payload.dh_pubkey, 32);
-            if (incoming_dh) {
-                if (!client->ratchet.peer_dh_pubkey) {
-                    /* Initial DR key received: set it without stepping the DH ratchet */
-                    client->ratchet.peer_dh_pubkey = incoming_dh;
-                    EVP_PKEY_up_ref(incoming_dh);
-                } else if (EVP_PKEY_eq(client->ratchet.peer_dh_pubkey, incoming_dh) != 1) {
-                    ratchet_dh_step(&client->ratchet, incoming_dh);
-                }
-                EVP_PKEY_free(incoming_dh);
-            }
-
-            /* Derive symmetric message key */
-            uint8_t msg_key[32];
-            if (ratchet_recv_step(&client->ratchet, msg_key) != SUCCESS) {
-                pthread_mutex_unlock(&client->ratchet_lock);
-                OPENSSL_cleanse(msg_key, 32);
-                continue;
-            }
-            pthread_mutex_unlock(&client->ratchet_lock);
-
-            /* Decrypt E2EE ciphertext using AES-GCM and verify tag */
-            uint8_t plaintext[MSG_PADDED_SIZE];
-            int pt_len = aes_decrypt(msg_key, chat_payload.nonce, chat_payload.ciphertext, 
-                                     MSG_PADDED_SIZE, chat_payload.tag, plaintext);
-            OPENSSL_cleanse(msg_key, 32);
-
-            if (pt_len < 0) {
-                fprintf(stderr, "[!] E2EE Decryption/Verification failed!\n");
-                continue;
-            }
-
-            /* Unpad */
-            uint8_t unpadded[MSG_PADDED_SIZE];
-            int unpadded_len = msg_unpad(plaintext, pt_len, unpadded);
-            if (unpadded_len < 0) {
-                fprintf(stderr, "[!] Unpadding failed\n");
-                continue;
-            }
-            unpadded[unpadded_len] = '\0';
-
-            /* Restore split usernames from sender payload cleanly */
-            char *space = strchr(chat_payload.sender, ' ');
-            if (space) *space = '\0';
-
-            const char *prio = (hdr.priority == PRIORITY_URGENT) ? "URGENT"
-                             : (hdr.priority == PRIORITY_CRITICAL) ? "CRITICAL"
-                             : "NORMAL";
-            client_log_format("[MSG][%s] %s: %s", prio, chat_payload.sender, (char *)unpadded);
-
-            if (!g_log_callback) {
-                printf("> ");
-                fflush(stdout);
-            }
-
-        } else if (hdr.msg_type == MSG_PREKEY_RESP) {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len == sizeof(PreKeyBundle)) {
-                PreKeyBundle bundle;
-                if (tls_recv(client->ssl, &bundle, sizeof(PreKeyBundle)) == sizeof(PreKeyBundle)) {
-                    pthread_mutex_lock(&client->ratchet_lock);
-                    client->pending_prekey = bundle;
-                    client->has_pending_prekey = 1;
-                    pthread_cond_signal(&client->prekey_cond);
-                    pthread_mutex_unlock(&client->ratchet_lock);
-                }
-            }
-        } else if (hdr.msg_type == MSG_ERROR || hdr.msg_type == MSG_OFFLINE_STORED || hdr.msg_type == MSG_USER_LIST_RESP) {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len > 0 && payload_len < 4096) {
-                uint8_t *msg = malloc(payload_len + 1);
-                if (msg && tls_recv(client->ssl, msg, payload_len) == (int)payload_len) {
-                    msg[payload_len] = '\0';
-                    const char *tag = (hdr.msg_type == MSG_ERROR) ? "SERVER"
-                                    : (hdr.msg_type == MSG_OFFLINE_STORED) ? "QUEUE"
-                                    : "USERS";
-                    client_log_format("[%s] %s", tag, (char *)msg);
-                    
-                    if (hdr.msg_type == MSG_ERROR) {
-                        pthread_mutex_lock(&client->ratchet_lock);
-                        client->has_pending_prekey = -1;
-                        pthread_cond_signal(&client->prekey_cond);
-                        pthread_mutex_unlock(&client->ratchet_lock);
-                    }
-                }
-                free(msg);
-            }
-        } else if (hdr.msg_type == MSG_ENGINE_STATE) {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len == 1) {
-                uint8_t mode_byte = 0;
-                if (tls_recv(client->ssl, &mode_byte, 1) == 1) {
-                    client->dh_ratchet_freq = (mode_byte == MODE_HIGH_RISK) ? 1 : 10;
-                }
-            }
-        } else {
-            uint32_t payload_len = ntohl(hdr.payload_len);
-            if (payload_len > 0) {
-                uint8_t *discard = malloc(payload_len);
-                if (discard) { tls_recv(client->ssl, discard, payload_len); free(discard); }
-            }
+        if (auth_hdr.msg_type != MSG_AUTH_OK) {
+            strncpy(ctx->connect_error, "Unexpected server response",
+                    sizeof(ctx->connect_error) - 1);
+            tls_close(ctx->ssl); return -1;
         }
-    }
-    return NULL;
-}
-
-void *send_thread_func(void *arg) {
-    ClientState *client = (ClientState *)arg;
-    char input_buf[MAX_MSG_LEN];
-
-    if (!g_log_callback) {
-        printf("\n> ");
-        fflush(stdout);
+        /* MSG_AUTH_OK — proceed */
     }
 
-    while (client->running && fgets(input_buf, sizeof(input_buf), stdin)) {
-        size_t len = strlen(input_buf);
-        if (len > 0 && input_buf[len-1] == '\n') {
-            input_buf[len-1] = '\0';
-            len--;
-        }
+    /* Init priority queue and dedup */
+    pq_init();
+    dedup_init();
 
-        if (len == 0) {
-            if (!g_log_callback) { printf("> "); fflush(stdout); }
-            continue;
-        }
+    /* Init engine */
+    engine_init(&ctx->engine);
 
-        if (strcmp(input_buf, "/quit") == 0) {
-            client->running = 0;
-            break;
-        }
+    g_ctx = ctx;
 
-        if (client_send_chat_message(client, input_buf) != 0) {
-            fprintf(stderr, "[!] E2EE message dispatch failed\n");
-        }
+    /* Spawn threads */
+    pthread_t recv_tid, send_tid;
+    pthread_create(&recv_tid, NULL, recv_thread, ctx);
+    pthread_create(&send_tid, NULL, send_thread, ctx);
+    pthread_detach(recv_tid);
+    pthread_detach(send_tid);
 
-        if (!g_log_callback) {
-            printf("> ");
-            fflush(stdout);
-        }
-    }
-    return NULL;
-}
-
-int client_start_threads(ClientState *client) {
-    if (pthread_create(&client->recv_thread, NULL, recv_thread_func, client) != 0) {
-        return -1;
-    }
-    if (pthread_create(&client->send_thread, NULL, send_thread_func, client) != 0) {
-        pthread_cancel(client->recv_thread);
-        return -1;
-    }
-    return 0;
-}
-
-void client_join_threads(ClientState *client) {
-    pthread_join(client->send_thread, NULL);
-    if (client->tcp_socket >= 0) {
-#ifdef PLATFORM_WINDOWS
-        shutdown(client->tcp_socket, SD_BOTH);
-#else
-        shutdown(client->tcp_socket, SHUT_RDWR);
+#ifndef HAVE_GTK
+    pthread_t input_tid;
+    pthread_create(&input_tid, NULL, input_thread_func, NULL);
+    pthread_detach(input_tid);
 #endif
-    }
-    pthread_join(client->recv_thread, NULL);
-}
 
-void client_cleanup(ClientState *client) {
-    if (client->ssl) {
-        tls_close(client->ssl);
-        client->ssl = NULL;
-    }
-    if (client->ssl_ctx) {
-        tls_free_ctx(client->ssl_ctx);
-        client->ssl_ctx = NULL;
-    }
-    if (client->tcp_socket >= 0) {
-        close(client->tcp_socket);
-        client->tcp_socket = -1;
-    }
-    if (client->udp_socket >= 0) {
-        close(client->udp_socket);
-        client->udp_socket = -1;
-    }
-    if (client->identity_keypair) {
-        EVP_PKEY_free(client->identity_keypair);
-        client->identity_keypair = NULL;
-    }
-    if (client->dh_identity_keypair) {
-        EVP_PKEY_free(client->dh_identity_keypair);
-        client->dh_identity_keypair = NULL;
-    }
-    if (client->signed_prekey_keypair) {
-        EVP_PKEY_free(client->signed_prekey_keypair);
-        client->signed_prekey_keypair = NULL;
-    }
-    if (client->otpk_keys) {
-        for (int i = 0; i < OTPK_COUNT; i++) EVP_PKEY_free(client->otpk_keys[i]);
-        free(client->otpk_keys);
-        client->otpk_keys = NULL;
-    }
-    save_ratchet_state(client);
-    ratchet_destroy(&client->ratchet);
-    pthread_mutex_destroy(&client->ratchet_lock);
-    pthread_cond_destroy(&client->prekey_cond);
-}
-
-int save_ratchet_state(ClientState *client) {
-    /* Conforms to headers, returns success */
-    (void)client;
     return 0;
 }
 
-int load_ratchet_state(ClientState *client) {
-    (void)client;
-    return -1;
+int client_send_chat_message(ClientContext *ctx,
+                              const char *recipient,
+                              const char *message) {
+    return client_send_chat_message_ex(ctx, recipient, message, PRIORITY_NORMAL);
 }
 
-int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority) {
-    size_t len = strlen(input_buf);
-    if (len == 0) return 0;
+int client_send_chat_message_ex(ClientContext *ctx,
+                                 const char *recipient,
+                                 const char *message,
+                                 uint8_t priority) {
+    (void)ctx;
+    QueuedMessage qm = {0};
+    qm.priority = priority;
+    qm.enqueue_time_ms = get_time_ms();
 
-    /* Parse directed recipient name */
-    char recipient[MAX_USERNAME_LEN] = {0};
-    const char *msg_body = input_buf;
-    if (input_buf[0] == '@') {
-        const char *space = strchr(input_buf, ' ');
-        if (space) {
-            size_t r_len = space - (input_buf + 1);
-            if (r_len > 0 && r_len < MAX_USERNAME_LEN) {
-                memcpy(recipient, input_buf + 1, r_len);
-                recipient[r_len] = '\0';
-                msg_body = space + 1;
-                while (*msg_body == ' ') msg_body++;
-            }
-        }
-    }
+    /* Format: "recipient\nmessage" */
+    int n = snprintf((char *)qm.payload, sizeof(qm.payload),
+                     "%s\n%s", recipient ? recipient : "", message);
+    if (n < 0) return -1;
+    qm.payload_len = (size_t)n;
 
-    if (recipient[0] == '\0') {
-        strcpy(recipient, "all");
-    }
-
-    /* initiator X3DH Bootstrap session if session is not active */
-    pthread_mutex_lock(&client->ratchet_lock);
-    if (!client->ratchet.dh_keypair && strcmp(recipient, "all") != 0) {
-        /* Alice sends PreKey request for Bob */
-        MsgHeader req_hdr = {
-            .version = PROTOCOL_VERSION,
-            .msg_type = MSG_PREKEY_REQ,
-            .priority = PRIORITY_NORMAL,
-            .flags = 0,
-            .payload_len = htonl((uint32_t)strlen(recipient)),
-            .checksum = 0
-        };
-        generate_random_bytes(req_hdr.msg_id, MSG_ID_LEN);
-        client->has_pending_prekey = 0;
-        tls_send(client->ssl, &req_hdr, sizeof(req_hdr));
-        tls_send(client->ssl, recipient, (int)strlen(recipient));
-
-        /* Wait for PreKey response from recv_thread */
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5; // 5 seconds timeout
-
-        while (client->has_pending_prekey == 0) {
-            int cond_res = pthread_cond_timedwait(&client->prekey_cond, &client->ratchet_lock, &ts);
-            if (cond_res != 0) {
-                pthread_mutex_unlock(&client->ratchet_lock);
-                return -1;
-            }
-        }
-
-        if (client->has_pending_prekey == -1) {
-            client->has_pending_prekey = 0;
-            pthread_mutex_unlock(&client->ratchet_lock);
-            return -1;
-        }
-
-        PreKeyBundle bobs_bundle = client->pending_prekey;
-        client->has_pending_prekey = 0;
-
-        /* Generate Alice ephemeral key and derive root key via X3DH */
-        EVP_PKEY *alice_ephem = dh_generate_keypair();
-        uint8_t shared_secret[32];
-        if (prekey_compute_x3dh_initiator(client->identity_keypair,
-                                          client->dh_identity_keypair,
-                                          alice_ephem, &bobs_bundle, 1, shared_secret) != SUCCESS) {
-            EVP_PKEY_free(alice_ephem);
-            pthread_mutex_unlock(&client->ratchet_lock);
-            return -1;
-        }
-
-        if (ratchet_init(&client->ratchet, shared_secret, 32, 1) != SUCCESS) {
-            EVP_PKEY_free(alice_ephem);
-            pthread_mutex_unlock(&client->ratchet_lock);
-            return -1;
-        }
-
-
-        /* Cache public X3DH keys in Alice's global session cache */
-        size_t id_pub_len = 32, ephem_pub_len = 32;
-        dh_get_public_key(client->dh_identity_keypair, g_alice_dh_id_pub, &id_pub_len);
-        dh_get_public_key(alice_ephem, g_alice_ephem_pub, &ephem_pub_len);
-        g_has_x3dh_cached = 1;
-
-        EVP_PKEY_free(alice_ephem);
-        client_log_format("[+] Derived X3DH E2EE Shared Secret with %s", recipient);
-    }
-
-    /* Pad message to 4096 bytes */
-    uint8_t padded[MSG_PADDED_SIZE];
-    if (msg_pad((const uint8_t *)msg_body, strlen(msg_body), padded) != SUCCESS) {
-        pthread_mutex_unlock(&client->ratchet_lock);
-        return -1;
-    }
-
-    /* Advance sending ratchet chain */
-    uint8_t msg_key[32];
-    if (client->ratchet.dh_keypair) {
-        if (ratchet_send_step(&client->ratchet, msg_key) != SUCCESS) {
-            pthread_mutex_unlock(&client->ratchet_lock);
-            OPENSSL_cleanse(msg_key, 32);
-            return -1;
-        }
-    } else {
-        /* Fallback for broadcast unencrypted or raw GCM placeholder */
-        memset(msg_key, 0x42, 32);
-    }
-
-    /* Extract current ephemeral DR public key */
-    uint8_t dr_pub[32] = {0};
-    if (client->ratchet.dh_keypair) {
-        size_t dr_pub_len = 32;
-        dh_get_public_key(client->ratchet.dh_keypair, dr_pub, &dr_pub_len);
-    }
-    uint32_t counter = client->ratchet.send_counter;
-    pthread_mutex_unlock(&client->ratchet_lock);
-
-    /* Encrypt padded payload using AES-256-GCM */
-    uint8_t iv[12];
-    uint8_t tag[16];
-    aes_generate_iv(iv);
-
-    uint8_t ciphertext[MSG_PADDED_SIZE];
-    if (aes_encrypt(msg_key, iv, padded, MSG_PADDED_SIZE, ciphertext, tag) < 0) {
-        OPENSSL_cleanse(msg_key, 32);
-        return -1;
-    }
-    OPENSSL_cleanse(msg_key, 32);
-
-    /* Build E2EEChatPayload payload cleanly */
-    E2EEChatPayload payload;
-    memset(&payload, 0, sizeof(E2EEChatPayload));
-    sprintf(payload.sender, "%s %s", client->username, recipient);
-    memcpy(payload.nonce, iv, 12);
-    memcpy(payload.tag, tag, 16);
-    memcpy(payload.dh_pubkey, dr_pub, 32);
-    payload.message_counter = counter;
-    if (g_has_x3dh_cached) {
-        memcpy(payload.alice_dh_identity_pub, g_alice_dh_id_pub, 32);
-        memcpy(payload.alice_ephemeral_pub, g_alice_ephem_pub, 32);
-    }
-
-    memcpy(payload.ciphertext, ciphertext, MSG_PADDED_SIZE);
-
-    /* Transmit the E2EE frame */
-    MsgHeader hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_CHAT,
-        .priority = priority,
-        .flags = 0,
-        .payload_len = htonl(sizeof(E2EEChatPayload)),
-        .checksum = 0
-    };
-    generate_random_bytes(hdr.msg_id, MSG_ID_LEN);
-
-    int send_ok = 0;
-    if (tls_send(client->ssl, &hdr, sizeof(hdr)) == sizeof(hdr) &&
-        tls_send(client->ssl, &payload, sizeof(E2EEChatPayload)) == sizeof(E2EEChatPayload)) {
-        send_ok = 1;
-    }
-
-    if (!send_ok) {
-        client_log_line("[!] E2EE frame transmission failed");
-        client->running = 0;
-        return -1;
-    }
-
-    trigger_dh_ratchet_if_needed(client);
-    return 0;
+    return pq_enqueue(&qm);
 }
 
-int client_send_chat_message(ClientState *client, const char *input_buf) {
-    return client_send_chat_message_ex(client, input_buf, PRIORITY_NORMAL);
+int client_request_user_list(ClientContext *ctx) {
+    uint8_t msg_id[MSG_ID_LEN];
+    RAND_bytes(msg_id, MSG_ID_LEN);
+    return send_message(ctx->ssl, MSG_USER_LIST_REQ,
+                        PRIORITY_NORMAL, 0, msg_id, NULL, 0);
 }
 
-int client_request_user_list(ClientState *client) {
-    MsgHeader hdr = {
-        .version = PROTOCOL_VERSION,
-        .msg_type = MSG_USER_LIST_REQ,
-        .priority = PRIORITY_NORMAL,
-        .payload_len = htonl(0)
-    };
-    generate_random_bytes(hdr.msg_id, MSG_ID_LEN);
-
-    if (tls_send(client->ssl, &hdr, sizeof(hdr)) != (int)sizeof(hdr)) {
-        return -1;
-    }
-    return 0;
+void client_set_log_callback(ClientContext *ctx,
+                              void (*cb)(const char *msg)) {
+    ctx->log_callback = cb;
 }
 
-#ifndef CLIENT_NO_MAIN
+void client_disconnect(ClientContext *ctx) {
+    ctx->running = 0;
+    pq_destroy();
+    ratchet_destroy(&ctx->ratchet);
+    tls_close(ctx->ssl);
+    ctx->ssl = NULL;
+}
+
+#ifndef HAVE_GTK
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <hostname> <port> <username>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <host> <port> <username>\n", argv[0]);
         return 1;
     }
 
-    const char *hostname = argv[1];
-    int port = atoi(argv[2]);
+    const char *host     = argv[1];
+    int         port     = atoi(argv[2]);
     const char *username = argv[3];
 
-    ClientState client;
-    g_client = &client;
-
-    signal(SIGINT, handle_shutdown);
-    signal(SIGTERM, handle_shutdown);
-
-    if (platform_socket_init() != 0) {
-        fprintf(stderr, "Failed to initialize socket platform\n");
+    ClientContext ctx = {0};
+    if (client_connect(&ctx, host, port, username) < 0) {
+        fprintf(stderr, "Connection failed\n");
         return 1;
     }
 
-    if (tls_init() != SUCCESS) {
-        fprintf(stderr, "Failed to initialize OpenSSL\n");
-        platform_socket_cleanup();
-        return 1;
-    }
+    printf("[CLIENT] Connected as %s. Type messages (prefix with @user to direct).\n", username);
+    printf("  Use '!urgent <msg>' or '!critical <msg>' for priority sends.\n");
+    printf("  Type '/users' to list online users.\n");
 
-    if (client_init(&client, hostname, port, username) != 0) {
-        fprintf(stderr, "Client initialization failed\n");
-        platform_socket_cleanup();
-        return 1;
-    }
+    /* Wait until disconnected */
+    while (ctx.running) sleep_ms(500);
 
-    if (authenticate_with_server(&client) != 0) {
-        fprintf(stderr, "Authentication failed\n");
-        client_cleanup(&client);
-        platform_socket_cleanup();
-        return 1;
-    }
-
-    printf("\n=== Connected as %s ===\n", username);
-    printf("Type E2EE messages as @username message, or /quit to exit\n\n");
-
-    if (client_start_threads(&client) != 0) {
-        fprintf(stderr, "Failed to start threads\n");
-        client_cleanup(&client);
-        platform_socket_cleanup();
-        return 1;
-    }
-
-    client_join_threads(&client);
-
-    printf("\nDisconnecting...\n");
-    client_cleanup(&client);
-    platform_socket_cleanup();
+    client_disconnect(&ctx);
     return 0;
 }
-#endif
+#endif /* HAVE_GTK */

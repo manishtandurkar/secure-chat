@@ -1,29 +1,27 @@
 #define _POSIX_C_SOURCE 200809L
-#include "dns_resolver.h"
-#include "platform_compat.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include "dns_resolver.h"
 
 int dns_resolve(const char *hostname, char *ip_out, size_t ip_out_len) {
-    if (!hostname || !ip_out || ip_out_len < INET_ADDRSTRLEN) {
-        return EAI_FAIL;
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(hostname, NULL, &hints, &res);
+    if (rc != 0) {
+        dns_print_error(rc);
+        return -1;
     }
 
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;       /* IPv4 only */
-    hints.ai_socktype = SOCK_STREAM; /* TCP */
-
-    int status = getaddrinfo(hostname, NULL, &hints, &res);
-    if (status != 0) {
-        return status;
-    }
-
-    /* Extract IP address from first result */
-    struct sockaddr_in *ipv4 = (struct sockaddr_in *)res->ai_addr;
-    if (!inet_ntop(AF_INET, &(ipv4->sin_addr), ip_out, ip_out_len)) {
+    struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+    if (!inet_ntop(AF_INET, &sa->sin_addr, ip_out, (socklen_t)ip_out_len)) {
         freeaddrinfo(res);
-        return EAI_SYSTEM;
+        return -1;
     }
 
     freeaddrinfo(res);
@@ -31,32 +29,19 @@ int dns_resolve(const char *hostname, char *ip_out, size_t ip_out_len) {
 }
 
 int dns_reverse_lookup(const char *ip_str, char *hostname_out, size_t len) {
-    if (!ip_str || !hostname_out || len == 0) {
-        return EAI_FAIL;
-    }
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
+    struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip_str, &sa.sin_addr) <= 0) return -1;
 
-    if (inet_pton(AF_INET, ip_str, &(sa.sin_addr)) != 1) {
-        return EAI_FAIL;
+    int rc = getnameinfo((struct sockaddr *)&sa, sizeof(sa),
+                          hostname_out, (socklen_t)len, NULL, 0, 0);
+    if (rc != 0) {
+        dns_print_error(rc);
+        return -1;
     }
-
-    int status = getnameinfo((struct sockaddr *)&sa, sizeof(sa),
-                            hostname_out, len, NULL, 0, 0);
-    return status;
+    return 0;
 }
 
 void dns_print_error(int gai_error_code) {
     fprintf(stderr, "DNS error: %s\n", gai_strerror(gai_error_code));
-}
-
-int is_valid_ipv4(const char *ip_str) {
-    if (!ip_str) {
-        return 0;
-    }
-
-    struct sockaddr_in sa;
-    return inet_pton(AF_INET, ip_str, &(sa.sin_addr)) == 1;
 }

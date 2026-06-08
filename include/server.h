@@ -1,75 +1,50 @@
 #ifndef SERVER_H
 #define SERVER_H
 
-#include "common.h"
-#include "tls_layer.h"
+#include <pthread.h>
+#include <openssl/ssl.h>
+#include "ratchet.h"
 #include "adaptive_engine.h"
+#include "common.h"
 
-/* Forward declarations */
-typedef struct evp_pkey_st EVP_PKEY;
+typedef struct {
+    int         fd;
+    SSL        *ssl;
+    char        username[MAX_USERNAME_LEN];
+    char        ip_str[48];
+    RatchetState ratchet;
+    int         active;
+    pthread_t   thread_id;
+} ClientEntry;
 
-/**
- * Main server entry point
- * Binds to SERVER_PORT and handles incoming connections
- */
-int server_main(int argc, char *argv[]);
+/* Server-wide shared state */
+extern EngineState g_engine_state;
+extern Metrics     g_metrics;
 
-/**
- * Handle a client connection (called in child process after fork)
- * Performs TLS handshake, DH exchange, authentication, and message routing
- */
-void handle_client(int connfd, SSL_CTX *ssl_ctx, EngineState *engine, Metrics *metrics);
+typedef struct {
+    int    connfd;
+    SSL   *ssl;
+    char   ip_str[48];
+} HandlerArg;
 
-/**
- * Signal handler for SIGCHLD to reap zombie processes
- */
-void sigchld_handler(int sig);
+void *handle_client(void *arg);
 
-/**
- * Initialize server resources (TLS context, UDP socket, etc.)
- */
-int server_init(void);
+/* Room management */
+int  room_join(const char *room, const char *username);
+int  room_leave(const char *room, const char *username);
+void room_broadcast(const char *room, const char *sender,
+                    const void *payload, size_t len, SSL_CTX *ctx);
 
-/**
- * Cleanup server resources
- */
-void server_cleanup(void);
+/* Auth */
+int  auth_verify(const char *username, const uint8_t *sig, size_t sig_len,
+                 const uint8_t *challenge, size_t challenge_len);
+int  auth_register_pubkey(const char *username, const char *pem_pubkey);
 
-/* Authentication manager functions */
-
-/**
- * Register user public key for authentication
- */
-int auth_register_pubkey(const char *username, EVP_PKEY *pubkey);
-
-/**
- * Verify RSA signature for authentication
- */
-int auth_verify_login(const char *username, const unsigned char *data,
-                      size_t data_len, const unsigned char *signature,
-                      size_t sig_len);
-
-/**
- * Broadcast current engine mode to all connected clients via MSG_ENGINE_STATE.
- * Called from server main loop when engine transitions between modes.
- */
-void broadcast_engine_state(AdaptiveMode new_mode);
-
-/* Room manager functions */
-
-/**
- * Add user to chat room
- */
-int room_add_member(const char *room_name, const char *username);
-
-/**
- * Remove user from chat room
- */
-int room_remove_member(const char *room_name, const char *username);
-
-/**
- * Get list of room members
- */
-int room_get_members(const char *room_name, char members[][MAX_USERNAME_LEN], int max_members);
+/* Client table */
+void     client_table_init(void);
+int      client_table_add(ClientEntry *entry);
+void     client_table_remove(const char *username);
+ClientEntry *client_table_find(const char *username);
+int      client_table_list(char *buf, size_t buf_len);
 
 #endif /* SERVER_H */

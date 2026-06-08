@@ -1,201 +1,97 @@
-#define _POSIX_C_SOURCE 200809L
-#include "platform_compat.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <openssl/ssl.h>
 #include "server.h"
+#include "socket_utils.h"
 #include "tls_layer.h"
 #include "adaptive_engine.h"
 #include "intrusion.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
+#include "common.h"
 
-typedef struct {
-    int connfd;
-    SSL_CTX *tls_ctx;
-    EngineState *engine;
-    Metrics *metrics;
-} ClientThreadArgs;
+static volatile int g_running = 1;
 
-static void *client_thread_main(void *arg) {
-    ClientThreadArgs *args = (ClientThreadArgs *)arg;
-    handle_client(args->connfd, args->tls_ctx, args->engine, args->metrics);
-    free(args);
-    return NULL;
+static void handle_sigint(int sig) {
+    (void)sig;
+    g_running = 0;
 }
 
-/* Signal handler for SIGCHLD to reap zombie processes */
-void sigchld_handler(int sig) {
-    (void)sig; /* Unused parameter */
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-}
+int main(void) {
+    signal(SIGINT,  handle_sigint);
+    signal(SIGPIPE, SIG_IGN);
 
-int main(int argc, char *argv[]) {
-    int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len;
-    int opt = 1;
-    SSL_CTX *tls_ctx = NULL;
-    EngineState engine;
-    Metrics metrics = {0};
-    AdaptiveMode prev_engine_mode = MODE_NORMAL;
+    /* Init subsystems */
+    client_table_init();
+    ids_init();
 
-    (void)argc; /* Unused parameter */
-    (void)argv; /* Unused parameter */
+    if (engine_init(&g_engine_state) < 0) {
+        fprintf(stderr, "engine_init failed\n");
+        return 1;
+    }
+    memset(&g_metrics, 0, sizeof(g_metrics));
 
-    if (platform_socket_init() != 0) {
-        fprintf(stderr, "Failed to initialize socket platform\n");
+    /* TLS */
+    SSL_CTX *ctx = tls_create_server_ctx("certs/server.crt", "certs/server.key");
+    if (!ctx) {
+        fprintf(stderr, "Failed to create TLS context\n");
         return 1;
     }
 
-    printf("Starting Adaptive Secure Communication System\n");
-    printf("Protocol Version: 0x%02x\n", PROTOCOL_VERSION);
-    printf("Features: Double Ratchet | Multi-Path | Adaptive Engine | Offline Queue\n\n");
+    int server_fd = socket_create_server(SERVER_PORT);
+    if (server_fd < 0) return 1;
 
-    /* Initialize adaptive engine */
-    if (engine_init(&engine) != SUCCESS) {
-        fprintf(stderr, "Failed to initialize adaptive engine\n");
-        return 1;
-    }
-    
-    printf("[Engine] Initialized in MODE_NORMAL\n");
+    printf("[SERVER] Listening on port %d (TLS 1.3)\n", SERVER_PORT);
 
-    /* Create TLS context */
-    tls_ctx = tls_create_server_ctx("certs/server.crt", "certs/server.key");
-    if (!tls_ctx) {
-        fprintf(stderr, "Failed to create TLS context. Run 'make certs' first.\n");
-        return 1;
-    }
-    
-    printf("[TLS] Server context created (TLS 1.3)\n");
-
-    /* Create socket */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        tls_free_ctx(tls_ctx);
-        return 1;
-    }
-
-    /* Set SO_REUSEADDR option */
-#ifdef PLATFORM_WINDOWS
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
-#else
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-#endif
-        perror("setsockopt");
-        socket_close(server_fd);
-        tls_free_ctx(tls_ctx);
-        return 1;
-    }
-
-    /* Initialize server address */
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(SERVER_PORT);
-
-    /* Bind socket */
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        socket_close(server_fd);
-        tls_free_ctx(tls_ctx);
-        return 1;
-    }
-
-    /* Start listening */
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
-        perror("listen");
-        socket_close(server_fd);
-        tls_free_ctx(tls_ctx);
-        return 1;
-    }
-
-    printf("[Server] Listening on port %d\n", SERVER_PORT);
-    printf("[Server] Waiting for connections...\n\n");
-
-    /* Main accept loop */
-    while (1) {
-        /* Periodically expire IDS blocks */
-        ids_expire_blocks();
-
-        /* Evaluate adaptive engine state and broadcast on mode change */
-        engine_evaluate(&engine, &metrics);
-        AdaptiveMode cur_mode = engine_get_mode(&engine);
-        if (cur_mode != prev_engine_mode) {
-            broadcast_engine_state(cur_mode);
-            prev_engine_mode = cur_mode;
-        }
-        
-        client_addr_len = sizeof(client_addr);
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
-        
-        if (client_fd < 0) {
-            int err = socket_errno;
-            if (socket_interrupted(err)) {
-                continue; /* Interrupted by signal, try again */
-            }
-            perror("accept");
+    while (g_running) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int connfd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (connfd < 0) {
+            if (g_running) perror("accept");
             continue;
         }
 
-        printf("[Server] New connection from %s:%d\n", 
-               inet_ntoa(client_addr.sin_addr), 
-               ntohs(client_addr.sin_port));
+        char ip_str[48];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
 
-        ClientThreadArgs *thread_args = malloc(sizeof(*thread_args));
-        if (!thread_args) {
-            perror("malloc");
-            socket_close(client_fd);
+        if (ids_is_blocked(ip_str)) {
+            ids_log_event("BLOCKED", ip_str);
+            close(connfd);
             continue;
         }
 
-        thread_args->connfd = client_fd;
-        thread_args->tls_ctx = tls_ctx;
-        thread_args->engine = &engine;
-        thread_args->metrics = &metrics;
+        SSL *ssl = tls_wrap_server_socket(ctx, connfd);
+        if (!ssl) {
+            close(connfd);
+            continue;
+        }
 
-        pthread_t client_thread;
-        if (pthread_create(&client_thread, NULL, client_thread_main, thread_args) != 0) {
+        HandlerArg *ha = malloc(sizeof(HandlerArg));
+        if (!ha) { tls_close(ssl); close(connfd); continue; }
+        ha->connfd = connfd;
+        ha->ssl    = ssl;
+        strncpy(ha->ip_str, ip_str, sizeof(ha->ip_str) - 1);
+
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid, &attr, handle_client, ha) != 0) {
             perror("pthread_create");
-            free(thread_args);
-            socket_close(client_fd);
-            continue;
+            free(ha);
+            tls_close(ssl);
         }
-
-        pthread_detach(client_thread);
+        pthread_attr_destroy(&attr);
     }
 
-    socket_close(server_fd);
-    tls_free_ctx(tls_ctx);
-    platform_socket_cleanup();
+    close(server_fd);
+    SSL_CTX_free(ctx);
+    engine_destroy();
+    printf("[SERVER] Shutdown complete.\n");
     return 0;
-}
-
-/* Server initialization function */
-int server_init(void) {
-    /* TODO: Implement server resource initialization
-     * 1. Create shared memory segment for EngineState
-     * 2. Initialize routing table (username → pid mapping)
-     * 3. Create offline_queue directory if not exists
-     * 4. Initialize UDP notification socket
-     * Returns 0 on success, -1 on error
-     */
-    fprintf(stderr, "[WARN] server_init not yet implemented (using inline init)\n");
-    return 0;
-}
-
-/* Server cleanup function */
-void server_cleanup(void) {
-    /* TODO: Implement server resource cleanup
-     * 1. Free shared memory segment
-     * 2. Clean up routing table
-     * 3. Close UDP notification socket
-     * 4. Expire all IDS blocks
-     */
-    fprintf(stderr, "[WARN] server_cleanup not yet implemented\n");
-}
-
-/* Main server entry point (wrapper for main) */
-int server_main(int argc, char *argv[]) {
-    return main(argc, argv);
 }

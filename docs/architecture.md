@@ -2,10 +2,6 @@
 
 ## Overview
 
-Adaptive Secure Communication System — a multi-client secure chat server written in C11 targeting Linux/WSL. Every message uses a unique per-message key derived via the Double Ratchet Algorithm. An Adaptive Engine monitors network and threat metrics and adjusts transport, retry, and cryptographic behavior at runtime.
-
-## System Diagram
-
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                              SERVER PROCESS                              │
@@ -13,164 +9,109 @@ Adaptive Secure Communication System — a multi-client secure chat server writt
 │  main() → socket/bind/listen → accept() loop → pthread per client       │
 │                                                                          │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  CLIENT THREAD (client_handler.c)                                  │  │
+│  │  CLIENT THREAD (client_handler)                                    │  │
 │  │  TLS handshake → DH exchange → RSA auth → Ratchet init            │  │
-│  │  Route directed/broadcast messages (or offline queue)             │  │
-│  │  Handle MSG_RATCHET_DH: perform DH step, reply with new pubkey    │  │
+│  │  Route directed encrypted messages (or offline queue)              │  │
+│  │  Feed metrics to Adaptive Engine                                   │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  Adaptive Engine (polling in accept loop)                                │
+│  Adaptive Engine (background thread)                                     │
 │  ┌─────────────┐    ┌──────────────────┐    ┌─────────────────────────┐ │
-│  │ MODE_NORMAL │ →  │  MODE_UNSTABLE   │ →  │    MODE_HIGH_RISK       │ │
-│  │ retries=3   │    │  retries=7       │    │  retries=10, padding,   │ │
-│  │ dh_freq=10  │    │  chunk=512       │    │  rand delay, dh_freq=1  │ │
+│  │ NORMAL MODE │ →  │  UNSTABLE MODE   │ →  │    HIGH-RISK MODE       │ │
+│  │ fast, lean  │    │ retry, chunk     │    │ pad, delay, rotate keys │ │
 │  └─────────────┘    └──────────────────┘    └─────────────────────────┘ │
-│  Mode change → broadcast MSG_ENGINE_STATE to all connected clients       │
 │                                                                          │
-│  IDS (intrusion.c): per-IP auth-fail counters, replay detection,         │
-│  5-minute block. Feeds directly into Adaptive Engine metrics.            │
-│                                                                          │
-│  Offline Queue (offline_queue.c): ciphertext persisted to               │
-│  data/offline_queue/<username>/ when recipient is offline.               │
-│  Drained on reconnect.                                                   │
+│  UDP thread → recvfrom() → presence + backup message copies             │
+│  Offline Queue → persist ciphertext → drain on reconnect                │
 └──────────────────────────────────────────────────────────────────────────┘
 
         TCP+TLS ▲                              TCP+TLS ▲
-        UDP     ▲  (backup, dedup by msg_id)   UDP     ▲
+        UDP     ▲                              UDP     ▲
                 │                                      │
 ┌───────────────┴──────────┐           ┌───────────────┴──────────┐
 │        CLIENT A          │           │        CLIENT B           │
-│  dns_resolver.c          │           │  dns_resolver.c           │
+│  DNS resolve             │           │  DNS resolve              │
 │  TLS connect             │           │  TLS connect              │
-│  DH → ratchet_init()     │           │  DH → ratchet_init()      │
+│  DH → ratchet init       │           │  DH → ratchet init        │
 │  RSA login               │           │  RSA login                │
-│  send_thread: encrypt    │  ──────►  │  recv_thread: decrypt     │
-│    ratchet_send_step()   │           │    ratchet_recv_step()    │
-│    aes_encrypt(msg_key)  │           │    aes_decrypt(msg_key)   │
-│  Every N msgs:           │           │  On MSG_RATCHET_DH:       │
-│    send MSG_RATCHET_DH   │  ◄──────  │    ratchet_dh_step()      │
-│    ratchet_dh_step()     │           │                           │
-│  On MSG_ENGINE_STATE:    │           │  On MSG_ENGINE_STATE:     │
-│    update dh_ratchet_freq│           │    update dh_ratchet_freq │
-│  Persist ratchet state   │           │  Persist ratchet state    │
-│  to ~/.aschat/user.ratchet│          │  to ~/.aschat/user.ratchet│
+│  Encrypt via ratchet key │  ──────►  │  Decrypt via ratchet key  │
+│  Send TCP + UDP          │           │  Accept first, discard dup│
+│  Adaptive mode aware     │           │  Adaptive mode aware      │
 └──────────────────────────┘           └──────────────────────────┘
 ```
 
-## Component Summary
+## Module Map
 
-| Component | File(s) | Responsibility |
-|-----------|---------|----------------|
-| Server main | `src/server/server.c` | Accept loop, engine eval, mode broadcast |
-| Client handler | `src/server/client_handler.c` | Per-client thread: handshake, routing, DH ratchet |
-| Auth manager | `src/server/auth_manager.c` | RSA signature verification |
-| Room manager | `src/server/room_manager.c` | Group membership tracking |
-| TLS layer | `src/tls/` | TLS 1.3 wrap/unwrap over TCP |
-| Double Ratchet | `src/crypto/ratchet.c` | Key derivation, DH ratchet step, state persistence |
-| RSA | `src/crypto/rsa_utils.c` | Auth keypair gen, sign, verify |
-| AES | `src/crypto/aes_utils.c` | AES-256-CBC encrypt/decrypt, padding |
-| DH exchange | `src/crypto/dh_exchange.c` | X25519 keypair, shared secret |
-| Crypto common | `src/crypto/crypto_common.c` | HKDF, HMAC-SHA256, kdf_ck, kdf_rk |
-| Adaptive engine | `src/engine/adaptive_engine.c` | State machine, mode transitions (30s stability gate) |
-| Metrics collector | `src/engine/metrics_collector.c` | Rolling packet loss, RTT, auth-fail, replay counters |
-| Multi-path | `src/transport/multipath.c` | Dual TCP+UDP send, msg_id deduplication ring buffer |
-| Offline queue | `src/transport/offline_queue.c` | Ciphertext persistence, drain on reconnect |
-| Priority queue | `src/transport/priority_queue.c` | CRITICAL/URGENT/NORMAL send ordering |
-| IDS | `src/security/intrusion.c` | Per-IP block list, replay detection, engine feed |
-| Socket utils | `src/net/socket_utils.c` | send_all, recv_all, CRC32 |
-| DNS resolver | `src/net/dns_resolver.c` | getaddrinfo wrapper |
-| UDP notify | `src/net/udp_notify.c` | UDP presence signals |
-| Client | `src/client/client.c` | Threads, ratchet persistence, DH trigger, engine handling |
-| GTK client | `src/client/gtk_client.c` | GUI: directed send, online users panel, priority presets |
+| Module | Files | Role |
+|--------|-------|------|
+| Server | `src/server/server.c`, `client_handler.c`, `room_manager.c`, `auth_manager.c` | TCP accept loop, per-client threads, routing, auth |
+| Client | `src/client/client.c`, `input_handler.c`, `display.c` | Connect, send/recv threads, UI |
+| Crypto | `src/crypto/ratchet.c`, `aes_utils.c`, `rsa_utils.c`, `crypto_common.c` | Double Ratchet, AES-256-CBC, RSA-2048, HKDF |
+| TLS | `src/tls/tls_server.c`, `tls_client.c` | TLS 1.3 wrap/unwrap |
+| Engine | `src/engine/adaptive_engine.c`, `metrics_collector.c` | State machine, rolling loss/RTT metrics |
+| Transport | `src/transport/multipath.c`, `offline_queue.c`, `priority_queue.c` | Dual TCP+UDP, offline storage, priority send |
+| Security | `src/security/intrusion.c` | Per-IP blocking, replay detection |
+| Net | `src/net/socket_utils.c`, `dns_resolver.c`, `udp_notify.c`, `message_utils.c` | Sockets, DNS, UDP, CRC32 |
 
-## Connection and Message Flow
+## Connection Flow
 
 ```
-CLIENT                                          SERVER THREAD
-  │                                                  │
-  │═══ TCP connect → TLS 1.3 handshake ════════════► │
-  │                                                  │
-  │─── MSG_DH_INIT (X25519 pubkey) ───────────────► │
-  │◄── MSG_DH_RESP (X25519 pubkey) ─────────────── │
-  │    Both: kdf_rk(shared_secret) → root_key        │
-  │    Both: ratchet_init()                           │
-  │                                                  │
-  │─── MSG_AUTH_REQ (username + RSA sig) ──────────► │
-  │◄── MSG_AUTH_OK ──────────────────────────────── │
-  │    [Offline queue drained if pending]             │
-  │                                                  │
-  │    ═══════ CHAT SESSION ACTIVE ═══════           │
-  │                                                  │
-  │    User types "@bob hello"                        │
-  │    ratchet_send_step() → msg_key                  │
-  │    aes_encrypt(msg_key, fresh_iv, padded)         │
-  │─── MSG_CHAT (IV + ciphertext) ─────────────────► │
-  │─── MSG_CHAT via UDP (backup copy) ─────────────► │
-  │                                                  │
-  │    Server decrypts, parses @bob, routes to bob   │
-  │    If bob offline: queue_store() on disk          │
-  │◄── MSG_OFFLINE_STORED ─────────────────────────  │
-  │                                                  │
-  │    Every N msgs (N = engine.dh_ratchet_freq):    │
-  │─── MSG_RATCHET_DH (new X25519 pubkey) ─────────► │
-  │    Server: ratchet_dh_step(), new chains          │
-  │◄── MSG_RATCHET_DH (server's new pubkey) ───────  │
-  │    Client: ratchet_dh_step(), forward secrecy    │
-  │                                                  │
-  │    On engine mode change (server → all clients): │
-  │◄── MSG_ENGINE_STATE (mode byte) ───────────────  │
-  │    Client: update dh_ratchet_freq                 │
+CLIENT                                          SERVER CHILD
+  |=== TCP connect → TLS handshake ================> |
+  |--- MSG_DH_INIT (X25519 public key) ------------> |
+  |<-- MSG_DH_RESP (X25519 public key) ------------- |
+  |    Both compute shared secret → ratchet_init()   |
+  |--- MSG_AUTH_REQ (username + RSA signature) -----> |
+  |<-- MSG_AUTH_OK ---------------------------------- |
+  |    [Offline queue drained]                        |
+  |--- MSG_CHAT (IV + AES-256-CBC ciphertext) ------> |
+  |    Server routes to recipient or offline queue    |
+  |<-- MSG_OFFLINE_STORED (if recipient offline) ---- |
+  | Every N messages:                                |
+  |--- MSG_RATCHET_DH (new DH pubkey) ------------->  |
 ```
+
+## Wire Protocol
+
+**Header (28 bytes):**
+```
+version(1) | msg_type(1) | priority(1) | flags(1) | msg_id(16) | payload_len(4) | checksum(4)
+```
+
+**Encrypted chat payload (constant 4112 bytes):**
+```
+IV(16) | AES-256-CBC(padded_message)(4096)
+```
+
+All `MSG_CHAT` payloads are always exactly 4112 bytes regardless of message length — traffic analysis resistance.
 
 ## Adaptive Engine State Machine
 
 ```
-              ┌──────────────────┐
-              │   MODE_NORMAL    │ retries=3, dh_freq=10, no padding
-              └────────┬─────────┘
-                       │
-       loss>5% OR      │  loss<5% AND stable 30s
-       timeouts≥3      │
-                       ▼
-              ┌──────────────────┐
-              │  MODE_UNSTABLE   │ retries=7, chunk=512
-              └────────┬─────────┘
-                       │
-     auth_fails≥5      │  stable 30s AND no threats
-     OR replays≥3      │
-     OR loss≥20%       │
-                       ▼
-              ┌──────────────────┐
-              │  MODE_HIGH_RISK  │ retries=10, force_padding, rand delay, dh_freq=1
-              └──────────────────┘
-```
+                ┌──────────────────┐
+                │   MODE_NORMAL    │  retries=3, delay=100ms, dh_freq=10
+                └────────┬─────────┘
+                         │ loss>5% OR timeouts≥3
+                         ▼
+                ┌──────────────────┐
+                │  MODE_UNSTABLE   │  retries=7, delay=200ms, chunk=512
+                └────────┬─────────┘
+                         │ auth_fails≥5 OR replays≥3 OR loss≥20%
+                         ▼
+                ┌──────────────────┐
+                │  MODE_HIGH_RISK  │  retries=10, padding=forced, delay=random, dh_freq=1
+                └──────────────────┘
 
-Upward transitions are immediate. Downward transitions require 30 consecutive seconds of clean metrics. Mode changes are broadcast to all clients via `MSG_ENGINE_STATE`.
+Downgrade requires 30s of stable metrics (hysteresis).
+```
 
 ## Security Properties
 
 | Property | Mechanism |
 |----------|-----------|
-| Confidentiality | AES-256-CBC, per-message key from Double Ratchet |
-| Forward secrecy | DH ratchet step every N messages; old keys are not stored |
-| Break-in recovery | DH ratchet rotates root/chain keys; compromise of one session key doesn't expose future messages |
-| Traffic analysis resistance | Fixed 4096-byte padded payload; random delays in HIGH_RISK mode |
-| Authentication | RSA-2048 signature over username at login |
-| Transport security | TLS 1.3 minimum enforced |
-| Replay protection | 1024-message deduplication ring buffer by msg_id |
-| Intrusion detection | Per-IP auth-fail counter; 5-minute block after 5 failures |
-| State persistence | Ratchet state encrypted with PBKDF2-derived key (10k iterations) at `~/.aschat/<user>.ratchet` |
-
-## Build Targets
-
-```
-make all          Build server + client + certs
-make tests        Build all test binaries (including test_tls)
-make test         Build and run test suite
-make gtk-client   Build GTK GUI client
-make phase1       Build Phase 1 TCP-only binaries
-make debug        Build with -DDEBUG -O0
-make release      Build with -O2 -DNDEBUG
-make clean        Remove build artifacts
-make clean-all    Remove artifacts and certificates
-```
+| Forward secrecy | Double Ratchet — each message has unique derived key |
+| Auth | RSA-2048 signatures over TLS 1.3 |
+| Traffic analysis resistance | All payloads padded to constant 4096 bytes |
+| Replay protection | 1024-entry dedup ring buffer per connection |
+| Brute-force protection | IDS per-IP block after 5 auth failures (5 min) |
+| Key erasure | `OPENSSL_cleanse()` on all key material after use |

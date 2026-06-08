@@ -1,133 +1,44 @@
 #ifndef CLIENT_H
 #define CLIENT_H
 
-#include "platform_compat.h"
-#include "common.h"
-#include "tls_layer.h"
+#include <openssl/ssl.h>
 #include "ratchet.h"
-#include "priority_queue.h"
-#include "prekey.h"
-#include <pthread.h>
-#include <openssl/evp.h>
+#include "adaptive_engine.h"
+#include "common.h"
 
-/* Client state structure */
 typedef struct {
-    SSL *ssl;
-    SSL_CTX *ssl_ctx;
-    char username[MAX_USERNAME_LEN];
-    char current_room[MAX_ROOM_NAME_LEN];
-    int tcp_socket;
-    int udp_socket;
-    struct sockaddr_in server_addr;
-    int running;
-    pthread_t recv_thread;
-    pthread_t send_thread;
-    pthread_t udp_thread;
+    SSL        *ssl;
+    int         udp_fd;
+    char        username[MAX_USERNAME_LEN];
+    char        server_host[256];
+    int         server_port;
     RatchetState ratchet;
-    EVP_PKEY *identity_keypair;     /* Ed25519 Signature Identity */
-    EVP_PKEY *dh_identity_keypair;  /* X25519 DH Identity Key */
-    EVP_PKEY *signed_prekey_keypair; /* X25519 Signed PreKey */
-    EVP_PKEY **otpk_keys;           /* Cache of Bob's One-Time PreKeys */
-    uint8_t dedup_set[DEDUP_WINDOW][MSG_ID_LEN];
-    int dedup_idx;
-    pthread_mutex_t ratchet_lock;
-    int dh_ratchet_freq; /* Messages between DH ratchet steps (from engine, default 10) */
-    PreKeyBundle pending_prekey;
-    int has_pending_prekey;
-    pthread_cond_t prekey_cond;
-} ClientState;
+    EngineState  engine;
+    int          running;
+    void (*log_callback)(const char *msg);
+    void (*message_callback)(const char *sender, const char *text, uint8_t priority, uint8_t flags);
+    void (*system_callback)(const char *msg);
+    void (*users_callback)(const char *user_list);
+    char connect_error[256];
+} ClientContext;
 
-typedef void (*ClientLogCallback)(const char *line, void *user_data);
+int  client_connect(ClientContext *ctx,
+                    const char *host, int port, const char *username);
 
-/**
- * Set an optional log callback used by GUI clients.
- */
-void client_set_log_callback(ClientLogCallback callback, void *user_data);
+int  client_send_chat_message(ClientContext *ctx,
+                               const char *recipient,
+                               const char *message);
 
-/**
- * Main client entry point
- * Usage: ./client <hostname> <port> <username>
- */
-int client_main(int argc, char *argv[]);
+int  client_send_chat_message_ex(ClientContext *ctx,
+                                  const char *recipient,
+                                  const char *message,
+                                  uint8_t priority);
 
-/**
- * Initialize client state and connect to server
- */
-int client_init(ClientState *client, const char *hostname, int port, const char *username);
+int  client_request_user_list(ClientContext *ctx);
 
-/**
- * Start client threads (recv and send)
- */
-int client_start_threads(ClientState *client);
+void client_set_log_callback(ClientContext *ctx,
+                              void (*cb)(const char *msg));
 
-/**
- * Wait for client threads to finish
- */
-void client_join_threads(ClientState *client);
-
-/**
- * Send a single chat message using the current ratchet state
- */
-int client_send_chat_message(ClientState *client, const char *input_buf);
-
-/**
- * Send a single chat message with explicit priority
- */
-int client_send_chat_message_ex(ClientState *client, const char *input_buf, uint8_t priority);
-
-/**
- * Request current online user list from server
- */
-int client_request_user_list(ClientState *client);
-
-/**
- * Cleanup client resources
- */
-void client_cleanup(ClientState *client);
-
-/**
- * Thread function for receiving messages from server
- */
-void *recv_thread_func(void *arg);
-
-/**
- * Thread function for sending messages to server
- */
-void *send_thread_func(void *arg);
-
-/**
- * Thread function for UDP presence and backup messages
- */
-void *udp_thread_func(void *arg);
-
-/**
- * Perform DH key exchange with server
- */
-int perform_dh_exchange(ClientState *client);
-
-/**
- * Authenticate with server using RSA signature
- */
-int authenticate_with_server(ClientState *client);
-
-/**
- * Save ratchet state to encrypted file
- */
-int save_ratchet_state(ClientState *client);
-
-/**
- * Load ratchet state from encrypted file
- */
-int load_ratchet_state(ClientState *client);
-
-/**
- * Check if message ID is in dedup set
- */
-int is_duplicate(ClientState *client, const uint8_t *msg_id);
-
-/**
- * Add message ID to dedup set
- */
-void add_to_dedup(ClientState *client, const uint8_t *msg_id);
+void client_disconnect(ClientContext *ctx);
 
 #endif /* CLIENT_H */

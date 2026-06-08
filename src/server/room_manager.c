@@ -1,116 +1,99 @@
-#include "server.h"
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include "server.h"
+#include "tls_layer.h"
+#include "common.h"
 
-#define MAX_ROOMS 50
+#define MAX_ROOMS     32
+#define MAX_ROOM_MEMBERS 50
 
 typedef struct {
-    char room_name[MAX_ROOM_NAME_LEN];
-    char members[MAX_CLIENTS][MAX_USERNAME_LEN];
-    int member_count;
-} ChatRoom;
+    char name[MAX_ROOM_NAME_LEN];
+    char members[MAX_ROOM_MEMBERS][MAX_USERNAME_LEN];
+    int  member_count;
+} Room;
 
-static ChatRoom rooms[MAX_ROOMS];
-static int room_count = 0;
+static Room    rooms[MAX_ROOMS];
+static int     room_count = 0;
+static pthread_mutex_t room_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Find or create room */
-static ChatRoom *find_or_create_room(const char *room_name) {
-    /* Find existing room */
-    for (int i = 0; i < room_count; i++) {
-        if (strcmp(rooms[i].room_name, room_name) == 0) {
-            return &rooms[i];
-        }
-    }
-    
-    /* Create new room */
-    if (room_count >= MAX_ROOMS) {
-        return NULL;
-    }
-    
-    ChatRoom *room = &rooms[room_count++];
-    strncpy(room->room_name, room_name, MAX_ROOM_NAME_LEN - 1);
-    room->member_count = 0;
-    
-    return room;
+static Room *find_room(const char *name) {
+    for (int i = 0; i < room_count; i++)
+        if (strcmp(rooms[i].name, name) == 0) return &rooms[i];
+    return NULL;
 }
 
-/* Add user to room */
-int room_add_member(const char *room_name, const char *username) {
-    if (!room_name || !username) {
-        return ERROR_GENERAL;
-    }
-    
-    ChatRoom *room = find_or_create_room(room_name);
-    if (!room) {
-        return ERROR_GENERAL;
-    }
-    
-    /* Check if already member */
-    for (int i = 0; i < room->member_count; i++) {
-        if (strcmp(room->members[i], username) == 0) {
-            return SUCCESS; /* Already in room */
+int room_join(const char *room, const char *username) {
+    pthread_mutex_lock(&room_lock);
+
+    Room *r = find_room(room);
+    if (!r) {
+        if (room_count >= MAX_ROOMS) {
+            pthread_mutex_unlock(&room_lock);
+            return -1;
         }
+        r = &rooms[room_count++];
+        memset(r, 0, sizeof(*r));
+        strncpy(r->name, room, MAX_ROOM_NAME_LEN - 1);
     }
-    
-    /* Add member */
-    if (room->member_count >= MAX_CLIENTS) {
-        return ERROR_GENERAL; /* Room full */
+
+    /* Check already member */
+    for (int i = 0; i < r->member_count; i++)
+        if (strcmp(r->members[i], username) == 0) {
+            pthread_mutex_unlock(&room_lock);
+            return 0;
+        }
+
+    if (r->member_count >= MAX_ROOM_MEMBERS) {
+        pthread_mutex_unlock(&room_lock);
+        return -1;
     }
-    
-    strncpy(room->members[room->member_count++], username, MAX_USERNAME_LEN - 1);
-    return SUCCESS;
+
+    strncpy(r->members[r->member_count++], username, MAX_USERNAME_LEN - 1);
+    pthread_mutex_unlock(&room_lock);
+    return 0;
 }
 
-/* Remove user from room */
-int room_remove_member(const char *room_name, const char *username) {
-    if (!room_name || !username) {
-        return ERROR_GENERAL;
-    }
-    
-    /* Find room */
-    ChatRoom *room = NULL;
-    for (int i = 0; i < room_count; i++) {
-        if (strcmp(rooms[i].room_name, room_name) == 0) {
-            room = &rooms[i];
+int room_leave(const char *room, const char *username) {
+    pthread_mutex_lock(&room_lock);
+
+    Room *r = find_room(room);
+    if (!r) { pthread_mutex_unlock(&room_lock); return -1; }
+
+    for (int i = 0; i < r->member_count; i++) {
+        if (strcmp(r->members[i], username) == 0) {
+            r->members[i][0] = '\0';
+            /* Compact */
+            for (int j = i; j < r->member_count - 1; j++)
+                memcpy(r->members[j], r->members[j+1], MAX_USERNAME_LEN);
+            r->member_count--;
             break;
         }
     }
-    
-    if (!room) {
-        return SUCCESS; /* Room doesn't exist */
-    }
-    
-    /* Remove member */
-    for (int i = 0; i < room->member_count; i++) {
-        if (strcmp(room->members[i], username) == 0) {
-            /* Shift remaining members */
-            for (int j = i; j < room->member_count - 1; j++) {
-                strcpy(room->members[j], room->members[j + 1]);
-            }
-            room->member_count--;
-            return SUCCESS;
-        }
-    }
-    
-    return SUCCESS;
+
+    pthread_mutex_unlock(&room_lock);
+    return 0;
 }
 
-/* Get room members (returns count, fills members array) */
-int room_get_members(const char *room_name, char members[][MAX_USERNAME_LEN], int max_members) {
-    if (!room_name || !members) {
-        return 0;
-    }
-    
-    /* Find room */
-    for (int i = 0; i < room_count; i++) {
-        if (strcmp(rooms[i].room_name, room_name) == 0) {
-            int count = rooms[i].member_count < max_members ? rooms[i].member_count : max_members;
-            for (int j = 0; j < count; j++) {
-                strncpy(members[j], rooms[i].members[j], MAX_USERNAME_LEN - 1);
-            }
-            return count;
+void room_broadcast(const char *room, const char *sender,
+                    const void *payload, size_t len, SSL_CTX *ctx) {
+    (void)ctx;
+    pthread_mutex_lock(&room_lock);
+
+    Room *r = find_room(room);
+    if (!r) { pthread_mutex_unlock(&room_lock); return; }
+
+    for (int i = 0; i < r->member_count; i++) {
+        if (strcmp(r->members[i], sender) == 0) continue;
+        ClientEntry *entry = client_table_find(r->members[i]);
+        if (entry && entry->ssl && entry->active) {
+            uint32_t plen_net = htonl((uint32_t)len);
+            tls_send(entry->ssl, &plen_net, 4);
+            tls_send(entry->ssl, payload, (int)len);
         }
     }
-    
-    return 0;
+
+    pthread_mutex_unlock(&room_lock);
 }

@@ -1,196 +1,164 @@
-#define _POSIX_C_SOURCE 200809L
-#include "platform_compat.h"
-#include "offline_queue.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
-
-#ifdef PLATFORM_WINDOWS
-#include <direct.h>
-#include <io.h>
-#define mkdir(path, mode) _mkdir(path)
-#else
 #include <unistd.h>
-#endif
+#include <errno.h>
+#include <time.h>
+#include "offline_queue.h"
+#include "common.h"
+#include "platform_compat.h"
 
-#define QUEUE_DIR "data/offline_queue"
+#define QUEUE_BASE_DIR "data/offline_queue"
 
-/* Ensure queue directory exists with correct permissions */
-static int ensure_queue_dir(void) {
-    struct stat st = {0};
-    
-    if (stat(QUEUE_DIR, &st) == -1) {
-        mkdir(QUEUE_DIR, 0700);
+static int ensure_dir(const char *path, mode_t mode) {
+    struct stat st;
+    if (stat(path, &st) == 0) return 0;
+    if (mkdir(path, mode) < 0 && errno != EEXIST) {
+        perror(path);
+        return -1;
     }
-    
-    return SUCCESS;
+    return 0;
 }
 
-/* Store encrypted message for offline user */
+static int get_user_dir(const char *username, char *path_out, size_t len) {
+    /* Sanitize username — allow only [a-zA-Z0-9_-] */
+    for (const char *p = username; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return -1;
+    }
+    snprintf(path_out, len, "%s/%s", QUEUE_BASE_DIR, username);
+    return 0;
+}
+
 int queue_store(const char *username,
                 const void *ciphertext, size_t len,
                 const uint8_t msg_id[MSG_ID_LEN]) {
-    if (!username || !ciphertext || !msg_id) {
-        return ERROR_GENERAL;
-    }
-    
-    ensure_queue_dir();
-    
-    /* Create user subdirectory */
-    char user_dir[512];
-    snprintf(user_dir, sizeof(user_dir), "%s/%s", QUEUE_DIR, username);
-    
-    struct stat st = {0};
-    if (stat(user_dir, &st) == -1) {
-        mkdir(user_dir, 0700);
-    }
-    
-    /* Generate filename with timestamp and message ID */
-    char filename[1024];
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t timestamp_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    
-    snprintf(filename, sizeof(filename), "%s/%llu_", user_dir, (unsigned long long)timestamp_ms);
-    
-    /* Append hex message ID */
-    char *ptr = filename + strlen(filename);
-    for (int i = 0; i < MSG_ID_LEN; i++) {
-        sprintf(ptr + i * 2, "%02x", msg_id[i]);
-    }
-    
-    /* Write ciphertext to file */
-    FILE *f = fopen(filename, "wb");
-    if (!f) {
-        return ERROR_GENERAL;
-    }
-    
+    if (ensure_dir(QUEUE_BASE_DIR, 0700) < 0) return -1;
+
+    char udir[256];
+    if (get_user_dir(username, udir, sizeof(udir)) < 0) return -1;
+    if (ensure_dir(udir, 0700) < 0) return -1;
+
+    /* Count existing — enforce OFFLINE_QUEUE_MAX */
+    if (queue_count(username) >= OFFLINE_QUEUE_MAX) return -1;
+
+    /* Filename: <timestamp_ms>_<msg_id_hex> */
+    char hex[MSG_ID_LEN * 2 + 1];
+    for (int i = 0; i < MSG_ID_LEN; i++)
+        snprintf(hex + i * 2, 3, "%02x", msg_id[i]);
+
+    char fname[512];
+    snprintf(fname, sizeof(fname), "%s/%llu_%s",
+             udir, (unsigned long long)get_time_ms(), hex);
+
+    FILE *f = fopen(fname, "wb");
+    if (!f) { perror(fname); return -1; }
+    chmod(fname, 0600);
+
+    uint32_t ulen = (uint32_t)len;
+    fwrite(&ulen, 4, 1, f);
     fwrite(ciphertext, 1, len, f);
     fclose(f);
-    
-    chmod(filename, 0600);
-    
-    return SUCCESS;
+    return 0;
 }
 
-/* Count pending messages */
 int queue_count(const char *username) {
-    if (!username) {
-        return 0;
-    }
-    
-    char user_dir[512];
-    snprintf(user_dir, sizeof(user_dir), "%s/%s", QUEUE_DIR, username);
-    
-    DIR *dir = opendir(user_dir);
-    if (!dir) {
-        return 0;
-    }
-    
+    char udir[256];
+    if (get_user_dir(username, udir, sizeof(udir)) < 0) return 0;
+
+    DIR *d = opendir(udir);
+    if (!d) return 0;
+
     int count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] != '.') {
-            count++;
-        }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        count++;
     }
-    
-    closedir(dir);
+    closedir(d);
     return count;
 }
 
-/* Drain queued messages */
 int queue_drain(const char *username,
                 int (*send_fn)(const void *payload, size_t len, void *ctx),
                 void *ctx) {
-    if (!username || !send_fn) {
-        return ERROR_GENERAL;
+    char udir[256];
+    if (get_user_dir(username, udir, sizeof(udir)) < 0) return -1;
+
+    DIR *d = opendir(udir);
+    if (!d) return 0;
+
+    /* Collect and sort filenames (ordering by timestamp prefix) */
+    char names[OFFLINE_QUEUE_MAX][256];
+    int  count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && count < OFFLINE_QUEUE_MAX) {
+        if (ent->d_name[0] == '.') continue;
+        snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
+        count++;
     }
-    
-    char user_dir[512];
-    snprintf(user_dir, sizeof(user_dir), "%s/%s", QUEUE_DIR, username);
-    
-    DIR *dir = opendir(user_dir);
-    if (!dir) {
-        return 0;
-    }
-    
+    closedir(d);
+
+    /* Simple sort by name (timestamp prefix ensures correct order) */
+    for (int i = 0; i < count - 1; i++)
+        for (int j = i + 1; j < count; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char tmp[256];
+                memcpy(tmp, names[i], 256);
+                memcpy(names[i], names[j], 256);
+                memcpy(names[j], tmp, 256);
+            }
+
     int delivered = 0;
-    struct dirent *entry;
-    char filepath[1024];
-    
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-        
-        snprintf(filepath, sizeof(filepath), "%s/%s", user_dir, entry->d_name);
-        
-        /* Read file */
-        FILE *f = fopen(filepath, "rb");
-        if (!f) {
-            continue;
-        }
-        
-        fseek(f, 0, SEEK_END);
-        long file_size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        
-        uint8_t *payload = malloc(file_size);
-        if (!payload) {
+    for (int i = 0; i < count; i++) {
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "%s/%s", udir, names[i]);
+
+        FILE *f = fopen(fpath, "rb");
+        if (!f) continue;
+
+        uint32_t ulen = 0;
+        if (fread(&ulen, 4, 1, f) != 1 || ulen > MSG_PADDED_SIZE + 64) {
             fclose(f);
             continue;
         }
-        
-        fread(payload, 1, file_size, f);
-        fclose(f);
-        
-        /* Send via callback */
-        if (send_fn(payload, file_size, ctx) == SUCCESS) {
-            unlink(filepath); /* Delete on successful delivery */
-            delivered++;
+
+        uint8_t *buf = malloc(ulen);
+        if (!buf) { fclose(f); continue; }
+
+        if (fread(buf, 1, ulen, f) == ulen) {
+            if (send_fn(buf, ulen, ctx) >= 0) {
+                unlink(fpath);
+                delivered++;
+            }
         }
-        
-        free(payload);
+        free(buf);
+        fclose(f);
     }
-    
-    closedir(dir);
+
     return delivered;
 }
 
-/* Clear all queued messages */
 int queue_clear(const char *username) {
-    if (!username) {
-        return ERROR_GENERAL;
+    char udir[256];
+    if (get_user_dir(username, udir, sizeof(udir)) < 0) return -1;
+
+    DIR *d = opendir(udir);
+    if (!d) return 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "%s/%s", udir, ent->d_name);
+        unlink(fpath);
     }
-    
-    char user_dir[512];
-    snprintf(user_dir, sizeof(user_dir), "%s/%s", QUEUE_DIR, username);
-    
-    DIR *dir = opendir(user_dir);
-    if (!dir) {
-        return SUCCESS;
-    }
-    
-    struct dirent *entry;
-    char filepath[1024];
-    
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-        
-        snprintf(filepath, sizeof(filepath), "%s/%s", user_dir, entry->d_name);
-        unlink(filepath);
-    }
-    
-    closedir(dir);
-    rmdir(user_dir);
-    
-    return SUCCESS;
+    closedir(d);
+    rmdir(udir);
+    return 0;
 }
