@@ -5,6 +5,7 @@
 #include "server.h"
 #include "crypto.h"
 #include "common.h"
+#include "crypto_log.h"
 
 /* Simple file-backed keystore: data/keys/<username>.pub */
 #define KEY_DIR "data/keys"
@@ -27,6 +28,7 @@ int auth_register_pubkey(const char *username, const char *pem_pubkey) {
     chmod(path, 0600);
     fputs(pem_pubkey, f);
     fclose(f);
+    crypto_log(CL_CYAN, "[AUTH]", "Pubkey stored for '%s' → %s", username, path);
     return 0;
 }
 
@@ -52,5 +54,9 @@ int auth_verify(const char *username,
 
     int rc = rsa_verify(pubkey, challenge, challenge_len, sig, sig_len);
     EVP_PKEY_free(pubkey);
+    if (rc == 0)
+        crypto_log(CL_GREEN, "[AUTH]", "RSA-2048/SHA256 signature OK for '%s' (sig=%zu B)", username, sig_len);
+    else
+        crypto_log(CL_RED,   "[AUTH]", "RSA-2048/SHA256 signature FAILED for '%s'", username);
     return rc;
 }

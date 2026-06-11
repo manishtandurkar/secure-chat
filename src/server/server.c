@@ -13,6 +13,7 @@
 #include "adaptive_engine.h"
 #include "intrusion.h"
 #include "common.h"
+#include "crypto_log.h"
 
 static volatile int g_running = 1;
 
@@ -21,9 +22,23 @@ static void handle_sigint(int sig) {
     g_running = 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--quiet-crypto") == 0) g_crypto_verbose = 0;
+    }
+
     signal(SIGINT,  handle_sigint);
     signal(SIGPIPE, SIG_IGN);
+
+    if (g_crypto_verbose) {
+        fprintf(stderr,
+            CL_BOLD CL_CYAN
+            "\n╔══════════════════════════════════════════╗\n"
+            "║   CRYPTO TRANSPARENCY MODE  ENABLED      ║\n"
+            "║   [TLS] [DH-EXCHANGE] [RATCHET] [AES]    ║\n"
+            "╚══════════════════════════════════════════╝\n"
+            CL_RESET "\n");
+    }
 
     /* Init subsystems */
     client_table_init();

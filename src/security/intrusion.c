@@ -5,6 +5,7 @@
 #include "intrusion.h"
 #include "adaptive_engine.h"
 #include "common.h"
+#include "crypto_log.h"
 
 typedef struct {
     char   ip[48];
@@ -86,9 +87,6 @@ void ids_expire_blocks(void) {
 }
 
 void ids_log_event(const char *event_type, const char *ip_str) {
-    time_t now = time(NULL);
-    char tbuf[32];
-    struct tm *tm_info = localtime(&now);
-    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm_info);
-    fprintf(stderr, "[IDS %s] %s from %s\n", tbuf, event_type, ip_str);
+    const char *color = (strcmp(event_type, "UNBLOCK") == 0) ? CL_GREEN : CL_RED;
+    crypto_log(color, "[IDS]", "%s from %s", event_type, ip_str);
 }

@@ -2,6 +2,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "tls_layer.h"
+#include "crypto_log.h"
 
 SSL_CTX *tls_create_server_ctx(const char *cert_file, const char *key_file) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
@@ -47,6 +48,9 @@ SSL *tls_wrap_server_socket(SSL_CTX *ctx, int connfd) {
         SSL_free(ssl);
         return NULL;
     }
+
+    crypto_log(CL_CYAN, "[TLS]", "Handshake OK — version=%s cipher=%s",
+               SSL_get_version(ssl), SSL_get_cipher_name(ssl));
 
     return ssl;
 }

@@ -14,16 +14,7 @@
 #include "offline_queue.h"
 #include "intrusion.h"
 #include "common.h"
-
-static int crypto_verbose(void) { return 1; }
-
-static void log_hex(const char *label, const uint8_t *buf, size_t len) {
-    size_t show = len < 32 ? len : 32;
-    fprintf(stderr, "%s", label);
-    for (size_t i = 0; i < show; i++) fprintf(stderr, "%02x", buf[i]);
-    if (len > 32) fprintf(stderr, "...[%zu bytes total]", len);
-    fprintf(stderr, "\n");
-}
+#include "crypto_log.h"
 
 /* Shared server globals */
 EngineState g_engine_state;
@@ -179,6 +170,14 @@ void *handle_client(void *arg) {
     EVP_PKEY *peer_pubkey = ratchet_pubkey_from_bytes(payload, peer_pub_len);
     if (!peer_pubkey) goto done;
 
+    /* Log client's X25519 public key */
+    {
+        uint8_t peer_raw[32];
+        size_t  peer_raw_len = sizeof(peer_raw);
+        if (EVP_PKEY_get_raw_public_key(peer_pubkey, peer_raw, &peer_raw_len) == 1)
+            crypto_log_hex(CL_YELLOW, "[DH-EXCHANGE]", "Client X25519 pubkey: ", peer_raw, peer_raw_len, 8);
+    }
+
     /* 2. Generate our DH keypair */
     EVP_PKEY *our_keypair = dh_generate_keypair();
     if (!our_keypair) { EVP_PKEY_free(peer_pubkey); goto done; }
@@ -189,6 +188,7 @@ void *handle_client(void *arg) {
     if (EVP_PKEY_get_raw_public_key(our_keypair, our_pub, &our_pub_len) != 1) {
         EVP_PKEY_free(our_keypair); EVP_PKEY_free(peer_pubkey); goto done;
     }
+    crypto_log_hex(CL_YELLOW, "[DH-EXCHANGE]", "Server X25519 pubkey: ", our_pub, our_pub_len, 8);
 
     uint8_t msg_id[MSG_ID_LEN];
     RAND_bytes(msg_id, MSG_ID_LEN);
@@ -203,6 +203,7 @@ void *handle_client(void *arg) {
     if (dh_compute_shared_secret(our_keypair, peer_pubkey, shared, &shared_len) < 0) {
         EVP_PKEY_free(our_keypair); EVP_PKEY_free(peer_pubkey); goto done;
     }
+    crypto_log_hex(CL_YELLOW, "[DH-EXCHANGE]", "Shared secret (X25519): ", shared, shared_len, 8);
     EVP_PKEY_free(our_keypair);
     EVP_PKEY_free(peer_pubkey);
 
@@ -239,10 +240,12 @@ void *handle_client(void *arg) {
     /* Challenge = username bytes */
     if (auth_verify(username, sig, sig_len_val,
                     (uint8_t *)username, strlen(username)) < 0) {
+        crypto_log(CL_RED, "[AUTH]", "Login REJECTED for '%s' from %s", username, ip);
         send_message(ssl, MSG_AUTH_FAIL, PRIORITY_NORMAL, 0, msg_id, NULL, 0);
         ids_record_auth_fail(ip, &g_metrics);
         goto done;
     }
+    crypto_log(CL_GREEN, "[AUTH]", "Login ACCEPTED for '%s' from %s", username, ip);
 
     /* Reject duplicate username */
     if (client_table_find(username)) {
@@ -272,6 +275,7 @@ void *handle_client(void *arg) {
     {
         ClientEntry *ce2 = client_table_find(username);
         if (ce2) {
+            crypto_log(CL_CYAN, "[QUEUE]", "Draining offline queue for '%s'", username);
             DrainCtx dc = { ssl, &ce2->ratchet };
             queue_drain(username, drain_send_fn, &dc);
         }
@@ -294,17 +298,20 @@ void *handle_client(void *arg) {
             uint8_t *ciphertext = payload + AES_IV_LEN;
             size_t   ct_len     = hdr.payload_len - AES_IV_LEN;
 
-            if (crypto_verbose()) {
-                fprintf(stderr, "\n[SERVER] MSG_CHAT from '%s' — E2EE layer:\n", username);
-                log_hex("[SERVER]   Ciphertext (gibberish): ", ciphertext, ct_len);
-            }
-
             /* Decrypt using sender's ratchet */
             ClientEntry *ce = client_table_find(username);
             if (!ce) break;
 
+            crypto_log(CL_MAGENTA, "[RATCHET]",
+                       "recv_step #%u for '%s': advancing recv_chain_key",
+                       ce->ratchet.recv_counter, username);
+
             uint8_t msg_key_in[RATCHET_KEY_LEN];
             ratchet_recv_step(&ce->ratchet, msg_key_in);
+
+            crypto_log_hex(CL_YELLOW, "[AES]", "  msg_key (AES-256 key): ", msg_key_in, RATCHET_KEY_LEN, 8);
+            crypto_log_hex(CL_CYAN,   "[AES]", "  IV (random 128-bit):   ", iv_in, AES_IV_LEN, AES_IV_LEN);
+            crypto_log_hex(CL_RED,    "[AES]", "  Ciphertext[0..16]:     ", ciphertext, ct_len, 16);
 
             uint8_t padded_in[MSG_PADDED_SIZE + 16];
             int pad_len = aes_decrypt(msg_key_in, iv_in, ciphertext,
@@ -318,8 +325,7 @@ void *handle_client(void *arg) {
             if (plain_len < 0) break;
             plain[plain_len] = '\0';
 
-            if (crypto_verbose())
-                fprintf(stderr, "[SERVER]   Decrypted plaintext: \"%s\"\n", (char *)plain);
+            crypto_log(CL_GREEN, "[AES]", "  AES-256-CBC decrypted: \"%.80s\"", (char *)plain);
 
             /* Split on '\n': before = recipient, after = message text */
             char recipient[MAX_USERNAME_LEN + 1] = {0};
@@ -341,6 +347,9 @@ void *handle_client(void *arg) {
 
             /* Helper: re-encrypt and send to a single destination entry */
             #define SEND_TO_DEST(dest_entry) do { \
+                crypto_log(CL_MAGENTA, "[RATCHET]", \
+                           "send_step #%u for '%s': advancing send_chain_key", \
+                           (dest_entry)->ratchet.send_counter, (dest_entry)->username); \
                 uint8_t msg_key_out[RATCHET_KEY_LEN]; \
                 ratchet_send_step(&(dest_entry)->ratchet, msg_key_out); \
                 uint8_t padded_out[MSG_PADDED_SIZE]; \
@@ -352,8 +361,11 @@ void *handle_client(void *arg) {
                 uint8_t ct_out[MSG_PADDED_SIZE + 32]; \
                 int ct_out_len = aes_encrypt(msg_key_out, iv_out, \
                                              padded_out, MSG_PADDED_SIZE, ct_out); \
+                crypto_log_hex(CL_YELLOW, "[AES]", "  msg_key (AES-256 key):  ", msg_key_out, RATCHET_KEY_LEN, 8); \
+                crypto_log_hex(CL_CYAN,   "[AES]", "  IV (fresh 128-bit):     ", iv_out, AES_IV_LEN, AES_IV_LEN); \
                 OPENSSL_cleanse(msg_key_out, sizeof(msg_key_out)); \
                 if (ct_out_len < 0) break; \
+                crypto_log_hex(CL_RED, "[AES]", "  Re-encrypted[0..16]:   ", ct_out, (size_t)ct_out_len, 16); \
                 uint8_t wire[AES_IV_LEN + MSG_PADDED_SIZE + 32]; \
                 memcpy(wire, iv_out, AES_IV_LEN); \
                 memcpy(wire + AES_IV_LEN, ct_out, (size_t)ct_out_len); \
@@ -369,6 +381,8 @@ void *handle_client(void *arg) {
                     SEND_TO_DEST(dest);
                 } else {
                     /* Offline: store plaintext "sender\nmessage" for later re-encryption */
+                    crypto_log(CL_YELLOW, "[QUEUE]",
+                               "Stored offline msg for '%s' (held encrypted at rest)", recipient);
                     queue_store(recipient, fwd_plain, (size_t)fwd_len, hdr.msg_id);
                     RAND_bytes(msg_id, MSG_ID_LEN);
                     send_message(ssl, MSG_OFFLINE_STORED, PRIORITY_NORMAL, 0,
@@ -399,10 +413,19 @@ void *handle_client(void *arg) {
         }
 
         case MSG_RATCHET_DH: {
+            ClientEntry *ce_dh = client_table_find(username);
+            if (ce_dh) {
+                crypto_log(CL_CYAN, "[RATCHET]",
+                           "DH ratchet triggered by '%s' (send_counter=%u) — rotating keys",
+                           username, ce_dh->ratchet.send_counter);
+                crypto_log_hex(CL_YELLOW, "[RATCHET]", "  old root_key: ",
+                               ce_dh->ratchet.root_key, RATCHET_KEY_LEN, 8);
+            }
             EVP_PKEY *peer_new = ratchet_pubkey_from_bytes(payload, hdr.payload_len);
-            if (peer_new) {
-                ClientEntry *ce = client_table_find(username);
-                if (ce) ratchet_dh_step(&ce->ratchet, peer_new);
+            if (peer_new && ce_dh) {
+                ratchet_dh_step(&ce_dh->ratchet, peer_new);
+                crypto_log_hex(CL_GREEN, "[RATCHET]", "  new root_key: ",
+                               ce_dh->ratchet.root_key, RATCHET_KEY_LEN, 8);
             }
             break;
         }

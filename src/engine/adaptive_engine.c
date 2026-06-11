@@ -6,6 +6,7 @@
 #include "adaptive_engine.h"
 #include "common.h"
 #include "platform_compat.h"
+#include "crypto_log.h"
 
 static pthread_t   g_engine_thread;
 static EngineState *g_state = NULL;
@@ -51,14 +52,19 @@ void engine_apply_mode(EngineState *state, AdaptiveMode new_mode) {
     }
 
     if (new_mode > old_mode) {
-        time_t now = time(NULL);
-        char tbuf[32];
-        struct tm *tm_info = localtime(&now);
-        strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm_info);
-        fprintf(stderr, "[ENGINE %s] mode %d → %d\n", tbuf, old_mode, new_mode);
+        crypto_log(CL_RED, "[ENGINE]",
+                   "ESCALATE mode %d → %d  (ratchet_freq=%d padding=%s random_delay=%s)",
+                   old_mode, new_mode,
+                   state->dh_ratchet_freq,
+                   state->force_padding ? "ON" : "off",
+                   state->random_delay  ? "ON" : "off");
         g_stable_since = 0;
     } else if (new_mode < old_mode) {
-        fprintf(stderr, "[ENGINE] downgrade to mode %d\n", new_mode);
+        crypto_log(CL_GREEN, "[ENGINE]",
+                   "downgrade mode %d → %d  (ratchet_freq=%d padding=%s)",
+                   old_mode, new_mode,
+                   state->dh_ratchet_freq,
+                   state->force_padding ? "ON" : "off");
     }
 }
 

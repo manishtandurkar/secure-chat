@@ -6,6 +6,7 @@
 #include "ratchet.h"
 #include "crypto.h"
 #include "common.h"
+#include "crypto_log.h"
 
 int ratchet_init(RatchetState *state,
                  const uint8_t *shared_secret, size_t secret_len,
@@ -48,6 +49,15 @@ int ratchet_init(RatchetState *state,
     state->recv_counter = 0;
     state->prev_send_counter = 0;
 
+    if (g_crypto_verbose) {
+        crypto_log(CL_CYAN, "[RATCHET]",
+                   "ratchet_init: role=%s  HKDF-SHA256 → root_key + send/recv chain_keys",
+                   is_initiator ? "initiator" : "responder");
+        crypto_log_hex(CL_YELLOW, "[RATCHET]", "  root_key:       ", state->root_key, RATCHET_KEY_LEN, 8);
+        crypto_log_hex(CL_YELLOW, "[RATCHET]", "  send_chain_key: ", state->send_chain_key, RATCHET_KEY_LEN, 8);
+        crypto_log_hex(CL_YELLOW, "[RATCHET]", "  recv_chain_key: ", state->recv_chain_key, RATCHET_KEY_LEN, 8);
+    }
+
     return 0;
 }
 
@@ -57,6 +67,14 @@ int ratchet_send_step(RatchetState *state, uint8_t *msg_key_out) {
     memcpy(state->send_chain_key, new_chain_key, RATCHET_KEY_LEN);
     OPENSSL_cleanse(new_chain_key, sizeof(new_chain_key));
     state->send_counter++;
+    if (g_crypto_verbose)
+        crypto_log(CL_MAGENTA, "[RATCHET]",
+                   "send_step #%u: HMAC-SHA256 chain_key[0..3]=%02x%02x%02x%02x"
+                   " → msg_key[0..3]=%02x%02x%02x%02x",
+                   state->send_counter - 1,
+                   state->send_chain_key[0], state->send_chain_key[1],
+                   state->send_chain_key[2], state->send_chain_key[3],
+                   msg_key_out[0], msg_key_out[1], msg_key_out[2], msg_key_out[3]);
     return 0;
 }
 
@@ -66,6 +84,14 @@ int ratchet_recv_step(RatchetState *state, uint8_t *msg_key_out) {
     memcpy(state->recv_chain_key, new_chain_key, RATCHET_KEY_LEN);
     OPENSSL_cleanse(new_chain_key, sizeof(new_chain_key));
     state->recv_counter++;
+    if (g_crypto_verbose)
+        crypto_log(CL_MAGENTA, "[RATCHET]",
+                   "recv_step #%u: HMAC-SHA256 chain_key[0..3]=%02x%02x%02x%02x"
+                   " → msg_key[0..3]=%02x%02x%02x%02x",
+                   state->recv_counter - 1,
+                   state->recv_chain_key[0], state->recv_chain_key[1],
+                   state->recv_chain_key[2], state->recv_chain_key[3],
+                   msg_key_out[0], msg_key_out[1], msg_key_out[2], msg_key_out[3]);
     return 0;
 }
 
@@ -114,6 +140,14 @@ int ratchet_dh_step(RatchetState *state, EVP_PKEY *peer_new_pubkey) {
     state->prev_send_counter = state->send_counter;
     state->send_counter = 0;
     state->recv_counter = 0;
+
+    if (g_crypto_verbose) {
+        crypto_log(CL_GREEN, "[RATCHET]",
+                   "dh_step complete: X25519 + KDF_RK → new root_key + chain_keys");
+        crypto_log_hex(CL_GREEN, "[RATCHET]", "  new root_key:       ", state->root_key, RATCHET_KEY_LEN, 8);
+        crypto_log_hex(CL_GREEN, "[RATCHET]", "  new send_chain_key: ", state->send_chain_key, RATCHET_KEY_LEN, 8);
+        crypto_log_hex(CL_GREEN, "[RATCHET]", "  new recv_chain_key: ", state->recv_chain_key, RATCHET_KEY_LEN, 8);
+    }
 
     OPENSSL_cleanse(dh_output, sizeof(dh_output));
     OPENSSL_cleanse(new_rk, sizeof(new_rk));

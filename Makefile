@@ -5,6 +5,7 @@ CFLAGS  = -Wall -Wextra -std=c11 -g -I./include \
 LDFLAGS = $(shell pkg-config --libs openssl) -lpthread -lrt
 
 SRC_COMMON = \
+    src/util/crypto_log.c \
     src/crypto/ratchet.c \
     src/crypto/rsa_utils.c \
     src/crypto/aes_utils.c \
