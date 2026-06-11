@@ -75,6 +75,7 @@ test_adaptive: tests/test_adaptive.c \
 	    tests/test_adaptive.c \
 	    src/engine/adaptive_engine.c \
 	    src/engine/metrics_collector.c \
+	    src/util/crypto_log.c \
 	    $(LDFLAGS)
 	./bin/test_adaptive
 
@@ -86,6 +87,7 @@ test_multipath: tests/test_multipath.c src/transport/multipath.c \
 	    src/tls/tls_client.c \
 	    src/tls/tls_server.c \
 	    src/net/udp_notify.c \
+	    src/util/crypto_log.c \
 	    $(LDFLAGS)
 	./bin/test_multipath
 
@@ -94,6 +96,7 @@ test_tls: tests/test_tls.c src/tls/tls_client.c src/tls/tls_server.c
 	    tests/test_tls.c \
 	    src/tls/tls_client.c \
 	    src/tls/tls_server.c \
+	    src/util/crypto_log.c \
 	    $(LDFLAGS)
 	./bin/test_tls
 
@@ -103,6 +106,7 @@ test_ids: tests/test_ids.c src/security/intrusion.c \
 	    tests/test_ids.c \
 	    src/security/intrusion.c \
 	    src/engine/metrics_collector.c \
+	    src/util/crypto_log.c \
 	    $(LDFLAGS)
 	./bin/test_ids
 
